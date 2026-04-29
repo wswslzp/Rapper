@@ -63,6 +63,9 @@ rapper --check            # Check status
 rapper --tmux [name]      # Start Tmux session (rapper-<name>)
 rapper --attach <name>    # Attach to session
 rapper --list             # List Rapper sessions
+
+rapper --background <name> --worktree -p "task" -w /project  # Isolated worktree mode
+rapper --merge <task_id>                               # Merge worktree + cleanup
 ```
 
 ## MCP Servers

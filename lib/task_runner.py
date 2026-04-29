@@ -48,6 +48,8 @@ class Task:
     session_id: str | None = None    # Claude session ID for --resume continuation
     max_budget_usd: float | None = None   # Cost cap in USD
     fallback_model: str | None = None     # Fallback model on overload
+    worktree_path: str | None = None      # 绝对路径，如 /app/rapper/.claude/worktrees/feat-auth
+    branch_name: str | None = None        # 如 rapper/feat-auth
     progress: list[dict] = field(default_factory=list)  # tool calls
     
     @property
@@ -76,6 +78,8 @@ class Task:
             "session_id": self.session_id,
             "max_budget_usd": self.max_budget_usd,
             "fallback_model": self.fallback_model,
+            "worktree_path": self.worktree_path,
+            "branch_name": self.branch_name,
             "progress": self.progress[-20:],  # Keep last 20 tool calls
             "updated_at": time.time(),
         }
@@ -110,6 +114,8 @@ class Task:
                 session_id=data.get("session_id"),
                 max_budget_usd=data.get("max_budget_usd"),
                 fallback_model=data.get("fallback_model"),
+                worktree_path=data.get("worktree_path"),
+                branch_name=data.get("branch_name"),
                 progress=data.get("progress", []),
             )
             return task
@@ -141,6 +147,49 @@ def generate_task_id() -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = ''.join(random.choices(string.ascii_lowercase, k=4))
     return f"{ts}-{suffix}"
+
+
+def setup_worktree(name: str, workdir: str) -> tuple[str, str]:
+    """Create a git worktree for isolated development.
+
+    Returns (worktree_path, branch_name).
+    Raises subprocess.CalledProcessError if git commands fail.
+    """
+    import subprocess
+    branch_name = f"rapper/{name}"
+    worktree_path = os.path.join(workdir, ".claude", "worktrees", name)
+
+    # Ensure parent directory exists
+    os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+
+    # Create worktree with new branch
+    subprocess.run(
+        ["git", "worktree", "add", worktree_path, "-b", branch_name],
+        cwd=workdir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return worktree_path, branch_name
+
+
+def remove_worktree(worktree_path: str, workdir: str) -> bool:
+    """Remove a git worktree.
+
+    Returns True on success, False on failure.
+    """
+    import subprocess
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", worktree_path, "--force"],
+            cwd=workdir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def list_tasks(status: str | None = None, limit: int = 20) -> list[Task]:
@@ -603,6 +652,7 @@ def main():
     run_p.add_argument("--workdir", "-w", default=".")
     run_p.add_argument("--budget", type=float, help="Budget cap in USD")
     run_p.add_argument("--fallback", help="Fallback model on overload")
+    run_p.add_argument("--worktree", action="store_true", help="Use git worktree isolation")
     
     args = parser.parse_args()
     
@@ -625,6 +675,10 @@ def main():
         print(f"Name:    {task.name}")
         print(f"Status:  {task.status}")
         print(f"Workdir: {task.workdir}")
+        if task.worktree_path:
+            print(f"Worktree: {task.worktree_path}")
+        if task.branch_name:
+            print(f"Branch:   {task.branch_name}")
         print(f"Elapsed: {task.elapsed_str()}")
         if task.pid:
             print(f"PID:     {task.pid}")
@@ -666,7 +720,18 @@ def main():
         # First fork detaches from parent
         task_id = generate_task_id()
         workdir = os.path.abspath(args.workdir)
-        
+
+        # Setup worktree if requested
+        worktree_path = None
+        branch_name = None
+        if args.worktree:
+            try:
+                worktree_path, branch_name = setup_worktree(args.name, workdir)
+                workdir = worktree_path
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to create worktree: {e}")
+                sys.exit(1)
+
         task = Task(
             id=task_id,
             name=args.name,
@@ -675,6 +740,8 @@ def main():
             status="pending",
             max_budget_usd=args.budget,
             fallback_model=args.fallback,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
         )
         task.save()
         

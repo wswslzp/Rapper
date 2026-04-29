@@ -114,6 +114,38 @@ Rapper 目前是**临时工模式（Ephemeral）**：由 Hermes 通过 `delegate
 
 ### 🟡 中优先级
 
+#### [TODO-003] Git Worktree 并行开发模式
+
+> **背景**：Claude Code 原生支持 `claude -w <name>` 在隔离的 git worktree 中工作，每个 worktree 是一个独立 branch。多个 Rapper 可以各自在不同 worktree/branch 上并行开发，最后统一 merge 回主干。Rapper 目前完全未封装此能力。
+
+**期望用法：**
+
+```bash
+# 在 worktree 模式启动后台任务（自动创建 branch + worktree）
+rapper --background feature-auth --worktree -p "实现 JWT 认证模块" -w /app/myproject
+
+# 多个 Rapper 并行，各自在独立 branch
+rapper --background feat-auth   --worktree -p "实现认证" -w /app/myproject
+rapper --background feat-search --worktree -p "实现搜索" -w /app/myproject
+rapper --background feat-cache  --worktree -p "实现缓存" -w /app/myproject
+
+# 查看各任务的 branch/worktree 信息
+rapper --status <task-id>   # 输出中显示 branch 和 worktree 路径
+
+# 任务完成后统一 merge（由 Hermes 或用户手动触发）
+rapper --merge <task-id>    # 将该任务的 branch merge 回主干并清理 worktree
+```
+
+**需要修改的地方：**
+
+- `rapper`（主脚本）：`do_background()` 加 `--worktree` flag，启动前调用 `git worktree add .claude/worktrees/<name> -b rapper/<name>` 创建隔离环境，把 worktree 路径作为 workdir 传给 claude。
+- `lib/task_runner.py`：`Task` dataclass 加 `worktree_path: str | None` 和 `branch_name: str | None` 字段，save/load 同步。
+- `rapper`（主脚本）：新增 `--merge <task-id>` 子命令，读取任务的 branch_name，执行 `git merge`，成功后 `git worktree remove` 清理。
+- `lib/task_runner.py`：status 输出中展示 worktree 路径和 branch 名。
+- **与 Claude Code 原生 `-w` 的关系**：Claude Code 的 `claude -w <name>` 会自动在 `.claude/worktrees/<name>` 创建 worktree；Rapper 自己管理 worktree 生命周期，这样 `rapper --merge` 才能有完整元数据。
+
+**估计工作量**：中等
+
 - [ ] 任务完成后自动回报结构化结果（JSON）给 Hermes
   - 当前：Rapper 返回纯文本，Hermes 自己解析
   - 目标：标准化 `{ status, output_path, pr_url, errors }` 格式
@@ -125,6 +157,46 @@ Rapper 目前是**临时工模式（Ephemeral）**：由 Hermes 通过 `delegate
 ---
 
 ### 🟢 低优先级
+
+#### [TODO-004] Claude Code 版本管理与自动更新
+
+> **发现时间**：2026-04-29
+> **背景**：Rapper 包装的是 Claude Code，但对其版本完全不感知。Claude Code 目前安装为 ELF 二进制（非 npm 包），路径 `~/.local/share/claude/versions/<version>/`，`~/.local/bin/claude` 是 symlink。更新方式是 `claude update`（Claude Code 自带自更新机制），而不是 `npm update`。
+
+**问题：**
+
+1. Rapper 无法感知当前 Claude Code 版本，无法判断是否需要更新
+2. 没有 `rapper --update-claude` 命令，无法从 Rapper 层面触发更新
+3. 无法在启动时检查版本并给出警告（"当前 Claude Code 已落后 N 个版本"）
+4. 无法在任务 status JSON 中记录执行时使用的 Claude Code 版本，不利于问题排查
+
+**期望功能：**
+
+```bash
+# 查看当前 Claude Code 版本
+rapper --claude-version
+
+# 检查是否有新版本可用（不更新）
+rapper --check-update
+
+# 触发 Claude Code 自更新
+rapper --update-claude
+# 内部执行：claude update
+# 更新成功后输出：Claude Code updated: 2.1.114 → 2.x.xxx
+```
+
+**需要修改的地方：**
+
+- `rapper`（主脚本）：新增 `--claude-version` / `--check-update` / `--update-claude` 三个子命令
+  - `--claude-version`：读取 `~/.local/bin/claude` symlink target，从路径提取版本号；或直接调用 `claude --version`
+  - `--check-update`：调用 `claude update --dry-run`（若支持），或查询 Claude Code 的 release API
+  - `--update-claude`：调用 `claude update`，捕获输出，记录更新前后版本到 `~/.rapper/update_log.txt`
+- `lib/task_runner.py`：status JSON 中补充 `"claude_version": "2.1.114"` 字段（每次任务启动时采集）
+- **可选**：启动时自动检查版本（如落后超过 N 个 minor，打印警告）
+
+**估计工作量**：小，主要是加 3 个 CLI 参数和一个版本采集函数
+
+---
 
 - [ ] Rapper 执行日志结构化（写入 Agent Board audit trail）
 - [ ] 支持 Rapper 在任务执行中途向 Hermes 发送中间状态更新

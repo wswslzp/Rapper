@@ -97,8 +97,6 @@
 
 **Task 2.2** — `start_task()` 签名加两个新参数，构建 claude cmd 时条件追加 `--max-budget-usd` / `--fallback-model`
 
-### ❌ 待完成
-
 **Task 2.3** — `rapper` bash 脚本 `do_background()` 解析 `--budget <usd>` 和 `--fallback <model>`；`task_runner.py run` 子命令 argparse 加这两个参数并透传
 
 **Task 1.4 / 2.4 / 3.1 / 3.2** — `claude-background-tasks` skill 文档更新（session_id 续接、fail_reason 区分、--budget/--fallback 用法、--no-session-persistence、--debug-file）
