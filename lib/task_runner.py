@@ -50,6 +50,7 @@ class Task:
     fallback_model: str | None = None     # Fallback model on overload
     worktree_path: str | None = None      # 绝对路径，如 /app/rapper/.claude/worktrees/feat-auth
     branch_name: str | None = None        # 如 rapper/feat-auth
+    repo_workdir: str | None = None       # 主 repo 路径（worktree 模式下与 workdir 不同）
     progress: list[dict] = field(default_factory=list)  # tool calls
     
     @property
@@ -80,6 +81,7 @@ class Task:
             "fallback_model": self.fallback_model,
             "worktree_path": self.worktree_path,
             "branch_name": self.branch_name,
+            "repo_workdir": self.repo_workdir,
             "progress": self.progress[-20:],  # Keep last 20 tool calls
             "updated_at": time.time(),
         }
@@ -116,6 +118,7 @@ class Task:
                 fallback_model=data.get("fallback_model"),
                 worktree_path=data.get("worktree_path"),
                 branch_name=data.get("branch_name"),
+                repo_workdir=data.get("repo_workdir"),
                 progress=data.get("progress", []),
             )
             return task
@@ -724,8 +727,10 @@ def main():
         # Setup worktree if requested
         worktree_path = None
         branch_name = None
+        repo_workdir = None
         if args.worktree:
             try:
+                repo_workdir = workdir  # Save original repo path before overwriting
                 worktree_path, branch_name = setup_worktree(args.name, workdir)
                 workdir = worktree_path
             except subprocess.CalledProcessError as e:
@@ -742,6 +747,7 @@ def main():
             fallback_model=args.fallback,
             worktree_path=worktree_path,
             branch_name=branch_name,
+            repo_workdir=repo_workdir,
         )
         task.save()
         

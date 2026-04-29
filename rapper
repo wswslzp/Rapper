@@ -277,7 +277,7 @@ task = get_task('${task_id}')
 if task is None:
     print(json.dumps({'error': 'Task not found'}))
 else:
-    print(json.dumps({'branch_name': task.branch_name, 'worktree_path': task.worktree_path, 'workdir': task.workdir, 'status': task.status}))
+    print(json.dumps({'branch_name': task.branch_name, 'worktree_path': task.worktree_path, 'workdir': task.workdir, 'repo_workdir': task.repo_workdir, 'status': task.status}))
 " 2>/dev/null)
 
     if [[ -z "$task_json" ]]; then
@@ -285,11 +285,20 @@ else:
         exit 1
     fi
 
-    local branch_name worktree_path workdir status
+    local branch_name worktree_path workdir repo_workdir status
     branch_name=$(echo "$task_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('branch_name',''))")
     worktree_path=$(echo "$task_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('worktree_path',''))")
     workdir=$(echo "$task_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workdir',''))")
+    repo_workdir=$(echo "$task_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('repo_workdir','') or '')")
     status=$(echo "$task_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))")
+
+    # Use repo_workdir (original main repo) for merge target; fall back to workdir for non-worktree tasks
+    local merge_target
+    if [[ -n "$repo_workdir" ]]; then
+        merge_target="$repo_workdir"
+    else
+        merge_target="$workdir"
+    fi
 
     if [[ -z "$branch_name" ]]; then
         log_error "Task $task_id has no worktree (branch_name is empty). Was it started with --worktree?"
@@ -298,15 +307,29 @@ else:
 
     log_info "Merging branch: $branch_name"
     log_info "From worktree:  $worktree_path"
-    log_info "Into:           $workdir"
+    log_info "Into:           $merge_target"
+
+    # Auto-commit any uncommitted changes in the worktree (Rapper writes files but doesn't git commit)
+    if [[ -n "$worktree_path" ]] && [[ -d "$worktree_path" ]]; then
+        local dirty
+        dirty=$(git -C "$worktree_path" status --porcelain 2>/dev/null)
+        if [[ -n "$dirty" ]]; then
+            log_info "Worktree has uncommitted changes — auto-committing before merge..."
+            git -C "$worktree_path" add -A
+            git -C "$worktree_path" commit -m "feat(${branch_name##*/}): auto-commit by rapper --merge"
+            log_ok "Auto-committed worktree changes"
+        else
+            log_info "Worktree is clean (no uncommitted changes)"
+        fi
+    fi
 
     # Merge the branch
-    if git -C "$workdir" merge "$branch_name"; then
+    if git -C "$merge_target" merge "$branch_name"; then
         log_ok "Merged $branch_name successfully"
 
         # Remove the worktree
         if [[ -n "$worktree_path" ]] && [[ -d "$worktree_path" ]]; then
-            if git -C "$workdir" worktree remove "$worktree_path" --force 2>/dev/null; then
+            if git -C "$merge_target" worktree remove "$worktree_path" --force 2>/dev/null; then
                 log_ok "Removed worktree: $worktree_path"
             else
                 log_warn "Could not remove worktree: $worktree_path (may need manual cleanup)"
@@ -314,14 +337,14 @@ else:
         fi
 
         # Delete the branch
-        if git -C "$workdir" branch -d "$branch_name" 2>/dev/null; then
+        if git -C "$merge_target" branch -d "$branch_name" 2>/dev/null; then
             log_ok "Deleted branch: $branch_name"
         else
             log_warn "Could not delete branch: $branch_name"
         fi
     else
         log_error "Merge failed. Resolve conflicts manually, then:"
-        log_error "  git -C $workdir merge --continue"
+        log_error "  git -C $merge_target merge --continue"
         exit 1
     fi
 }
