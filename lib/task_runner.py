@@ -201,11 +201,18 @@ def _make_worktree_safe_prompt(prompt: str, repo_workdir: str, worktree_path: st
     # Replace occurrences of the repo root path with "." (relative to worktree cwd)
     # e.g. "/app/myproject/src/foo.py"  →  "./src/foo.py"
     # e.g. "/app/myproject/"            →  "./"
+    # e.g. "/app/myproject and"         →  ". and"
     # Use word-boundary-aware replacement to avoid partial matches
     safe_prompt = re.sub(
-        re.escape(repo_root) + r"(/|$)",
-        lambda m: "./" if m.group(1) == "/" else ".",
+        re.escape(repo_root) + r"(/)",
+        r"./",
         prompt,
+    )
+    # Then replace standalone repo path (followed by space/end)
+    safe_prompt = re.sub(
+        re.escape(repo_root) + r"(?=\s|$)",
+        ".",
+        safe_prompt,
     )
 
     # Prepend isolation guard
