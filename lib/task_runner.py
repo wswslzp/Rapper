@@ -176,6 +176,55 @@ def setup_worktree(name: str, workdir: str) -> tuple[str, str]:
     return worktree_path, branch_name
 
 
+def _make_worktree_safe_prompt(prompt: str, repo_workdir: str, worktree_path: str) -> str:
+    """Rewrite a prompt for safe execution inside a git worktree.
+
+    Two transformations:
+    1. Replace absolute paths pointing to the main repo with relative paths,
+       so Claude Code's file tools operate inside the worktree instead of main repo.
+    2. Prepend a strict isolation instruction so Claude Code knows it must
+       stay within the worktree directory and use relative paths only.
+
+    Args:
+        prompt:        Original task prompt.
+        repo_workdir:  Absolute path to the main repo (e.g. /app/myproject).
+        worktree_path: Absolute path to this task's worktree (e.g. /app/myproject/.claude/worktrees/task-slug).
+
+    Returns:
+        Modified prompt with isolation guard prepended and absolute repo paths rewritten.
+    """
+    import re
+
+    # Normalize: ensure repo_workdir has no trailing slash
+    repo_root = repo_workdir.rstrip("/")
+
+    # Replace occurrences of the repo root path with "." (relative to worktree cwd)
+    # e.g. "/app/myproject/src/foo.py"  →  "./src/foo.py"
+    # e.g. "/app/myproject/"            →  "./"
+    # Use word-boundary-aware replacement to avoid partial matches
+    safe_prompt = re.sub(
+        re.escape(repo_root) + r"(/|$)",
+        lambda m: "./" if m.group(1) == "/" else ".",
+        prompt,
+    )
+
+    # Prepend isolation guard
+    guard = (
+        f"⚠️ WORKTREE ISOLATION GUARD ⚠️\n"
+        f"You are running inside an isolated git worktree: {worktree_path}\n"
+        f"The main repository is at: {repo_root}\n"
+        f"CRITICAL RULES — you MUST follow these or your work will be lost:\n"
+        f"1. Use ONLY relative paths for all file read/write/edit operations.\n"
+        f"2. NEVER use the absolute path '{repo_root}' or any path outside your worktree.\n"
+        f"3. Your current working directory IS the project root — treat '.' as the repo root.\n"
+        f"4. Example: to edit 'src/foo.py', use path 'src/foo.py' or './src/foo.py', NOT '{repo_root}/src/foo.py'.\n"
+        f"5. Do NOT run 'git checkout', 'git branch', or any command that switches branches.\n"
+        f"--- END GUARD ---\n\n"
+    )
+
+    return guard + safe_prompt
+
+
 def remove_worktree(worktree_path: str, workdir: str) -> bool:
     """Remove a git worktree.
 
@@ -728,11 +777,15 @@ def main():
         worktree_path = None
         branch_name = None
         repo_workdir = None
+        prompt = args.prompt
         if args.worktree:
             try:
                 repo_workdir = workdir  # Save original repo path before overwriting
                 worktree_path, branch_name = setup_worktree(args.name, workdir)
                 workdir = worktree_path
+                # Rewrite prompt: replace absolute repo paths with relative paths
+                # and prepend isolation guard instruction
+                prompt = _make_worktree_safe_prompt(prompt, repo_workdir, worktree_path)
             except subprocess.CalledProcessError as e:
                 print(f"Failed to create worktree: {e}")
                 sys.exit(1)
@@ -740,7 +793,7 @@ def main():
         task = Task(
             id=task_id,
             name=args.name,
-            prompt=args.prompt,
+            prompt=prompt,
             workdir=workdir,
             status="pending",
             max_budget_usd=args.budget,
