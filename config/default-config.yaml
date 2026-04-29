@@ -1,0 +1,50 @@
+# Rapper default configuration
+# User config location: ~/.rapper/config.yaml
+
+claude:
+  # Default model (can be overridden with -m flag)
+  model: "claude-sonnet-4-20250514"
+
+safety:
+  # Enable outbound guard for scheduled/autonomous tasks
+  # When enabled, sends to non-whitelisted targets are blocked
+  outbound_guard_enabled: true
+  
+  # Additional patterns to block in bash-runner (regex)
+  bash_extra_blocked: []
+  
+  # Whitelist for outbound communications
+  # Only applies to scheduled tasks (RAPPER_SCHEDULED=1)
+  # Interactive sessions are unrestricted
+  outbound_whitelist:
+    # Discord channel IDs (numeric strings)
+    discord:
+      # - "1234567890123456789"
+      # - "9876543210987654321"
+    
+    # Telegram chat IDs (can be negative for groups)
+    telegram:
+      # - "-1001234567890"
+      # - "123456789"
+    
+    # Email addresses (case-insensitive)
+    email:
+      # - "user@example.com"
+      # - "team@company.com"
+    
+    # Slack channel IDs or names
+    slack:
+      # - "#general"
+      # - "C01234ABCDE"
+
+tmux:
+  # Default session name suffix (will become rapper-<name>)
+  default_session_name: "default"
+  
+  # Idle timeout in minutes (0 = never)
+  idle_timeout: 0
+
+logging:
+  enabled: true
+  level: "info"
+  # Log location: ~/.rapper/logs/

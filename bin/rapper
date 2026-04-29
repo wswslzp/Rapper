@@ -1,0 +1,3 @@
+#!/bin/bash
+# Wrapper for PATH installation
+exec /app/rapper/rapper "$@"

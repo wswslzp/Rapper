@@ -1,0 +1,435 @@
+#!/bin/bash
+#
+# Rapper 🎤 — Claude Code wrapper with safety guardrails
+#
+# Usage:
+#   rapper                    # Interactive mode
+#   rapper -p "prompt"        # One-shot prompt
+#   rapper --acp --stdio      # ACP mode (for Hermes)
+#   rapper --check            # Check status
+#   rapper --setup            # Force re-setup
+#   rapper --tmux <name>      # Start Tmux session (rapper-<name>)
+#   rapper --attach <name>    # Attach to existing session
+#   rapper --list             # List Tmux sessions
+#
+set -euo pipefail
+
+RAPPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAPPER_CONFIG_DIR="${HOME}/.rapper"
+RAPPER_CONFIG="${RAPPER_CONFIG_DIR}/config.yaml"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+log_info() { echo -e "${BLUE}[rapper]${NC} $*"; }
+log_ok() { echo -e "${GREEN}[rapper]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[rapper]${NC} $*"; }
+log_error() { echo -e "${RED}[rapper]${NC} $*" >&2; }
+
+# --- Setup ---
+
+needs_setup() {
+    # Check if first-time setup is needed
+    [[ ! -d "$RAPPER_CONFIG_DIR" ]] && return 0
+    [[ ! -f "$RAPPER_CONFIG" ]] && return 0
+    [[ ! -f "${RAPPER_DIR}/.venv/bin/python" ]] && return 0
+    return 1
+}
+
+run_setup() {
+    log_info "Running first-time setup..."
+    
+    # 1. Create config directory
+    if [[ ! -d "$RAPPER_CONFIG_DIR" ]]; then
+        mkdir -p "$RAPPER_CONFIG_DIR"
+        mkdir -p "$RAPPER_CONFIG_DIR/logs"
+        log_ok "Created $RAPPER_CONFIG_DIR"
+    fi
+    
+    # 2. Copy default config if not exists
+    if [[ ! -f "$RAPPER_CONFIG" ]]; then
+        cp "${RAPPER_DIR}/config/default-config.yaml" "$RAPPER_CONFIG"
+        log_ok "Created default config at $RAPPER_CONFIG"
+    fi
+    
+    # 3. Install Python dependencies
+    if [[ ! -f "${RAPPER_DIR}/.venv/bin/python" ]]; then
+        log_info "Installing Python dependencies..."
+        (cd "$RAPPER_DIR" && uv sync)
+        log_ok "Python dependencies installed"
+    fi
+    
+    # 4. Register MCP with Claude
+    register_mcp
+    
+    # 5. Configure settings.json (hooks, permissions)
+    configure_settings
+    
+    log_ok "Setup complete! 🎤"
+}
+
+configure_settings() {
+    log_info "Configuring Claude Code settings.json..."
+    
+    local settings_script="${RAPPER_DIR}/config/setup_settings.py"
+    if [[ -f "$settings_script" ]]; then
+        "${RAPPER_DIR}/.venv/bin/python3" "$settings_script" --rapper-dir "$RAPPER_DIR"
+        log_ok "settings.json configured (outbound_guard, bash blocker)"
+    else
+        log_warn "setup_settings.py not found, skipping settings configuration"
+    fi
+}
+
+register_mcp() {
+    local claude_json="${HOME}/.claude.json"
+    local mcp_config='{
+  "mcpServers": {
+    "bash-runner": {
+      "command": "uv",
+      "args": ["--directory", "'"$RAPPER_DIR"'", "run", "python", "mcp-servers/bash-runner/server.py"]
+    }
+  }
+}'
+    
+    if [[ ! -f "$claude_json" ]]; then
+        echo "$mcp_config" > "$claude_json"
+        log_ok "Created $claude_json with bash-runner MCP"
+    else
+        # Check if bash-runner already registered
+        if grep -q '"bash-runner"' "$claude_json" 2>/dev/null; then
+            log_info "bash-runner MCP already registered"
+        else
+            log_warn "~/.claude.json exists but doesn't have bash-runner."
+            log_warn "Please manually add bash-runner MCP or run: rapper --setup --force"
+            log_info "MCP config to add:"
+            echo "$mcp_config"
+        fi
+    fi
+}
+
+# --- Check ---
+
+do_check() {
+    echo "🎤 Rapper Status Check"
+    echo "====================="
+    
+    # Check rapper directory
+    echo -n "Rapper directory: "
+    if [[ -d "$RAPPER_DIR" ]]; then
+        echo -e "${GREEN}OK${NC} ($RAPPER_DIR)"
+    else
+        echo -e "${RED}MISSING${NC}"
+    fi
+    
+    # Check config
+    echo -n "Config file: "
+    if [[ -f "$RAPPER_CONFIG" ]]; then
+        echo -e "${GREEN}OK${NC} ($RAPPER_CONFIG)"
+    else
+        echo -e "${YELLOW}NOT FOUND${NC} (will create on first run)"
+    fi
+    
+    # Check Python venv
+    echo -n "Python venv: "
+    if [[ -f "${RAPPER_DIR}/.venv/bin/python" ]]; then
+        local py_version=$("${RAPPER_DIR}/.venv/bin/python" --version 2>&1)
+        echo -e "${GREEN}OK${NC} ($py_version)"
+    else
+        echo -e "${YELLOW}NOT INSTALLED${NC} (will install on first run)"
+    fi
+    
+    # Check MCP registration
+    echo -n "MCP registration: "
+    if [[ -f "${HOME}/.claude.json" ]] && grep -q '"bash-runner"' "${HOME}/.claude.json" 2>/dev/null; then
+        echo -e "${GREEN}REGISTERED${NC}"
+    else
+        echo -e "${YELLOW}NOT REGISTERED${NC}"
+    fi
+    
+    # Check settings.json hooks
+    echo -n "Outbound guard: "
+    if [[ -f "${HOME}/.claude/settings.json" ]] && grep -q 'outbound_guard.py' "${HOME}/.claude/settings.json" 2>/dev/null; then
+        echo -e "${GREEN}CONFIGURED${NC}"
+    else
+        echo -e "${YELLOW}NOT CONFIGURED${NC}"
+    fi
+    
+    echo -n "Bash blocker: "
+    if [[ -f "${HOME}/.claude/settings.json" ]] && grep -q 'Use mcp__bash-runner__run_bash' "${HOME}/.claude/settings.json" 2>/dev/null; then
+        echo -e "${GREEN}CONFIGURED${NC}"
+    else
+        echo -e "${YELLOW}NOT CONFIGURED${NC}"
+    fi
+    
+    # Check Claude Code
+    echo -n "Claude Code: "
+    if command -v claude &>/dev/null; then
+        local claude_version=$(claude --version 2>&1 | head -1)
+        echo -e "${GREEN}INSTALLED${NC} ($claude_version)"
+    else
+        echo -e "${RED}NOT FOUND${NC} (required)"
+    fi
+    
+    # List Tmux sessions
+    echo ""
+    echo "Rapper Tmux Sessions:"
+    if command -v tmux &>/dev/null; then
+        local sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^rapper-' || true)
+        if [[ -n "$sessions" ]]; then
+            echo "$sessions" | while read -r s; do
+                echo "  - $s"
+            done
+        else
+            echo "  (none)"
+        fi
+    else
+        echo "  (tmux not installed)"
+    fi
+}
+
+# --- Tmux ---
+
+do_tmux() {
+    local session_name="$1"
+    
+    # Ensure rapper- prefix
+    if [[ ! "$session_name" =~ ^rapper- ]]; then
+        session_name="rapper-${session_name}"
+    fi
+    
+    # Check if session exists
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+        log_info "Session '$session_name' already exists. Attaching..."
+        exec tmux attach-session -t "$session_name"
+    fi
+    
+    # Create new session with Claude
+    log_info "Creating Tmux session: $session_name"
+    tmux new-session -d -s "$session_name" -c "$(pwd)"
+    tmux send-keys -t "$session_name" "claude" Enter
+    exec tmux attach-session -t "$session_name"
+}
+
+do_attach() {
+    local session_name="$1"
+    
+    # Ensure rapper- prefix
+    if [[ ! "$session_name" =~ ^rapper- ]]; then
+        session_name="rapper-${session_name}"
+    fi
+    
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+        exec tmux attach-session -t "$session_name"
+    else
+        log_error "Session '$session_name' not found"
+        exit 1
+    fi
+}
+
+do_list() {
+    echo "Rapper Tmux Sessions:"
+    local sessions=$(tmux list-sessions -F '#{session_name}: #{session_windows} windows (created #{session_created})' 2>/dev/null | grep '^rapper-' || true)
+    if [[ -n "$sessions" ]]; then
+        echo "$sessions"
+    else
+        echo "  (none)"
+    fi
+}
+
+# --- Task Runner Commands ---
+
+do_task_list() {
+    local status="${1:-}"
+    "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py" list ${status:+--status "$status"}
+}
+
+do_task_status() {
+    local task_id="${1:?Task ID required}"
+    "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py" status "$task_id"
+}
+
+do_task_logs() {
+    local task_id="${1:?Task ID required}"
+    shift
+    local lines="${1:-50}"
+    "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py" logs "$task_id" --lines "$lines"
+}
+
+do_task_cancel() {
+    local task_id="${1:?Task ID required}"
+    "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py" cancel "$task_id"
+}
+
+do_background() {
+    local name="${1:?Task name required}"
+    shift
+    local prompt=""
+    local workdir="$(pwd)"
+    local budget=""
+    local fallback_model=""
+
+    # Parse remaining args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p)
+                shift
+                prompt="${1:-}"
+                ;;
+            -w|--workdir)
+                shift
+                workdir="${1:-$(pwd)}"
+                ;;
+            --budget)
+                shift
+                budget="${1:-}"
+                ;;
+            --fallback)
+                shift
+                fallback_model="${1:-}"
+                ;;
+            *)
+                # If no -p flag, treat remaining as prompt
+                if [[ -z "$prompt" ]]; then
+                    prompt="$1"
+                fi
+                ;;
+        esac
+        shift 2>/dev/null || break
+    done
+
+    if [[ -z "$prompt" ]]; then
+        log_error "Usage: rapper --background <name> -p 'prompt' [-w workdir] [--budget <usd>] [--fallback <model>]"
+        exit 1
+    fi
+
+    log_info "Starting background task: $name"
+    local cmd=(
+        "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py"
+        run "$name" "$prompt" --workdir "$workdir"
+    )
+
+    if [[ -n "$budget" ]]; then
+        cmd+=(--budget "$budget")
+    fi
+
+    if [[ -n "$fallback_model" ]]; then
+        cmd+=(--fallback "$fallback_model")
+    fi
+
+    "${cmd[@]}"
+}
+
+# --- Main ---
+
+main() {
+    # Handle special commands first
+    case "${1:-}" in
+        --check)
+            do_check
+            exit 0
+            ;;
+        --setup)
+            run_setup
+            exit 0
+            ;;
+        --tmux)
+            shift
+            local name="${1:-default}"
+            if needs_setup; then run_setup; fi
+            do_tmux "$name"
+            ;;
+        --attach)
+            shift
+            local name="${1:?Session name required}"
+            do_attach "$name"
+            ;;
+        --list)
+            do_list
+            exit 0
+            ;;
+        # --- Background Task Commands ---
+        --background|-bg)
+            shift
+            if needs_setup; then run_setup; fi
+            do_background "$@"
+            exit 0
+            ;;
+        --tasks)
+            shift
+            if needs_setup; then run_setup; fi
+            do_task_list "${1:-}"
+            exit 0
+            ;;
+        --status)
+            shift
+            if needs_setup; then run_setup; fi
+            do_task_status "${1:?Task ID required}"
+            exit 0
+            ;;
+        --logs)
+            shift
+            if needs_setup; then run_setup; fi
+            do_task_logs "$@"
+            exit 0
+            ;;
+        --cancel)
+            shift
+            if needs_setup; then run_setup; fi
+            do_task_cancel "${1:?Task ID required}"
+            exit 0
+            ;;
+        --help|-h)
+            cat << 'EOF'
+Rapper 🎤 — Claude Code wrapper with safety guardrails
+
+USAGE:
+    rapper [OPTIONS] [CLAUDE_ARGS...]
+
+INTERACTIVE MODE:
+    rapper                          # Interactive Claude
+    rapper -p "hello"               # One-shot prompt
+    rapper --acp --stdio            # ACP mode for Hermes
+
+TMUX SESSIONS (interactive):
+    rapper --tmux <name>            # Start Claude in Tmux session
+    rapper --attach <name>          # Attach to existing session
+    rapper --list                   # List Tmux sessions
+
+BACKGROUND TASKS (autonomous):
+    rapper --background <name> -p "task"   # Start background task
+    rapper --tasks [status]                # List tasks
+    rapper --status <task_id>              # Get task status
+    rapper --logs <task_id> [lines]        # View task logs
+    rapper --cancel <task_id>              # Cancel running task
+
+MANAGEMENT:
+    rapper --check                  # Check Rapper status
+    rapper --setup                  # Run first-time setup
+
+ENVIRONMENT:
+    RAPPER_DIR      Rapper installation directory
+    
+CONFIG:
+    ~/.rapper/config.yaml           # User configuration
+    ~/.rapper/tasks/                # Background task files
+
+For more info, see: https://github.com/your/rapper
+EOF
+            exit 0
+            ;;
+    esac
+    
+    # Auto-setup if needed
+    if needs_setup; then
+        run_setup
+    fi
+    
+    # Pass through to Claude Code
+    exec claude "$@"
+}
+
+main "$@"
