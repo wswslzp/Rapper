@@ -52,6 +52,7 @@ class Task:
     worktree_path: str | None = None      # 绝对路径，如 /app/rapper/.claude/worktrees/feat-auth
     branch_name: str | None = None        # 如 rapper/feat-auth
     repo_workdir: str | None = None       # 主 repo 路径（worktree 模式下与 workdir 不同）
+    claude_version: str | None = None     # Claude Code version when task started
     progress: list[dict] = field(default_factory=list)  # tool calls
     
     @property
@@ -85,6 +86,7 @@ class Task:
             "worktree_path": self.worktree_path,
             "branch_name": self.branch_name,
             "repo_workdir": self.repo_workdir,
+            "claude_version": self.claude_version,
             "progress": self.progress[-20:],  # Keep last 20 tool calls
             "updated_at": time.time(),
         }
@@ -123,6 +125,7 @@ class Task:
                 worktree_path=data.get("worktree_path"),
                 branch_name=data.get("branch_name"),
                 repo_workdir=data.get("repo_workdir"),
+                claude_version=data.get("claude_version"),
                 progress=data.get("progress", []),
             )
             # Note: workdir_effective is not stored in Task object, only in JSON for status reporting
@@ -425,9 +428,23 @@ class TaskRunner:
         task_id = generate_task_id()
         workdir = workdir or os.getcwd()
         model = model or self.default_model
-        
+
         # Add structured result instructions to prompt
         enhanced_prompt = _add_structured_result_instructions(prompt)
+
+        # Capture Claude Code version
+        claude_version = None
+        try:
+            result = subprocess.run(
+                [self.claude_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                claude_version = result.stdout.strip().split('\n')[0]  # First line only
+        except Exception:
+            pass  # Version capture is optional, don't fail task creation
 
         task = Task(
             id=task_id,
@@ -437,6 +454,7 @@ class TaskRunner:
             status="pending",
             max_budget_usd=max_budget_usd,
             fallback_model=fallback_model,
+            claude_version=claude_version,
         )
         task.save()
         
