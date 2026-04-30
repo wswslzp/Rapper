@@ -527,7 +527,7 @@ class TaskRunner:
                 except Exception:
                     pass
     
-    def _run_task_sync(self, task: Task, timeout: int = 3600):
+    def _run_task_sync(self, task: Task, timeout: int = 3600, max_turns: int = 200):
         """Run a task synchronously (for daemon process)."""
         model = self.default_model
         
@@ -538,7 +538,7 @@ class TaskRunner:
             "--model", model,
             "--output-format", "stream-json",
             "--verbose",
-            "--max-turns", "50",
+            "--max-turns", str(max_turns),
             "--dangerously-skip-permissions",
         ]
 
@@ -712,6 +712,7 @@ def main():
     run_p.add_argument("--budget", type=float, help="Budget cap in USD")
     run_p.add_argument("--fallback", help="Fallback model on overload")
     run_p.add_argument("--worktree", action="store_true", help="Use git worktree isolation")
+    run_p.add_argument("--max-turns", type=int, default=200, dest="max_turns", help="Maximum Claude turns (default: 200)")
     
     args = parser.parse_args()
     
@@ -835,7 +836,7 @@ def main():
         
         # Run the task synchronously in daemon process
         runner = TaskRunner()
-        runner._run_task_sync(task)
+        runner._run_task_sync(task, max_turns=args.max_turns)
     
     else:
         parser.print_help()

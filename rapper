@@ -357,6 +357,7 @@ do_background() {
     local budget=""
     local fallback_model=""
     local use_worktree=false
+    local max_turns="200"
 
     # Parse remaining args
     while [[ $# -gt 0 ]]; do
@@ -380,6 +381,10 @@ do_background() {
             --worktree)
                 use_worktree=true
                 ;;
+            --max-turns)
+                shift
+                max_turns="${1:-200}"
+                ;;
             *)
                 # If no -p flag, treat remaining as prompt
                 if [[ -z "$prompt" ]]; then
@@ -391,14 +396,14 @@ do_background() {
     done
 
     if [[ -z "$prompt" ]]; then
-        log_error "Usage: rapper --background <name> -p 'prompt' [-w workdir] [--budget <usd>] [--fallback <model>]"
+        log_error "Usage: rapper --background <name> -p 'prompt' [-w workdir] [--budget <usd>] [--fallback <model>] [--max-turns <n>]"
         exit 1
     fi
 
     log_info "Starting background task: $name"
     local cmd=(
         "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py"
-        run "$name" "$prompt" --workdir "$workdir"
+        run "$name" "$prompt" --workdir "$workdir" --max-turns "$max_turns"
     )
 
     if [[ -n "$budget" ]]; then
