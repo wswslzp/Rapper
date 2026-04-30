@@ -44,6 +44,14 @@ tmux:
   # Idle timeout in minutes (0 = never)
   idle_timeout: 0
 
+agent_board:
+  # Agent Board API configuration for daemon mode
+  url: "http://localhost:3456"
+  api_key: ""  # Optional API key for authentication
+  agent_id: ""  # Agent ID (auto-generated if empty)
+  poll_interval: 30  # Task polling interval in seconds
+  webhook_port: 18789  # Local webhook port for task notifications
+
 logging:
   enabled: true
   level: "info"

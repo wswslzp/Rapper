@@ -1,0 +1,37 @@
+[Unit]
+Description=Rapper Agent Daemon (instance %i)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=rapper
+Group=rapper
+WorkingDirectory=/app/rapper
+Environment=RAPPER_DIR=/app/rapper
+ExecStart=/app/rapper/rapper --daemon --agent-id rapper-%i
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/app/rapper /home/rapper/.rapper /home/rapper/.claude
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=200%
+
+# Timeout settings
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
