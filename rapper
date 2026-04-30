@@ -1,7 +1,6 @@
 #!/bin/bash
 #
 # Rapper 🎤 — Claude Code wrapper with safety guardrails
-echo "TESTING: Script is running"
 #
 # Usage:
 #   rapper                    # Interactive mode
@@ -189,6 +188,70 @@ do_check() {
         fi
     else
         echo "  (tmux not installed)"
+    fi
+}
+
+# --- Version Management ---
+
+do_claude_version() {
+    # Show current Claude Code version
+    if command -v claude &>/dev/null; then
+        claude --version 2>&1 | head -1
+    else
+        log_error "Claude Code not found. Please install Claude Code first."
+        exit 1
+    fi
+}
+
+do_check_update() {
+    # Check if there are updates available without updating
+    if ! command -v claude &>/dev/null; then
+        log_error "Claude Code not found. Please install Claude Code first."
+        exit 1
+    fi
+
+    log_info "Checking for Claude Code updates..."
+
+    # Try to use claude update --check if available
+    if claude update --check &>/dev/null; then
+        local check_output=$(claude update --check 2>&1)
+        if echo "$check_output" | grep -q "up.to.date\|already.*latest\|no.*update"; then
+            log_ok "Claude Code is up to date"
+        else
+            log_warn "Updates available:"
+            echo "$check_output"
+        fi
+    else
+        # Fallback: compare current version with npm registry (if available)
+        log_warn "Could not check for updates automatically"
+        log_info "Current version:"
+        claude --version 2>&1 | head -1
+        log_info "Run 'claude update' manually to check for updates"
+    fi
+}
+
+do_update_claude() {
+    # Update Claude Code and show version change
+    if ! command -v claude &>/dev/null; then
+        log_error "Claude Code not found. Please install Claude Code first."
+        exit 1
+    fi
+
+    # Get current version
+    local old_version=$(claude --version 2>&1 | head -1)
+    log_info "Current version: $old_version"
+
+    log_info "Updating Claude Code..."
+    if claude update; then
+        local new_version=$(claude --version 2>&1 | head -1)
+        if [[ "$old_version" != "$new_version" ]]; then
+            log_ok "Updated: $old_version → $new_version"
+        else
+            log_ok "Already up to date: $new_version"
+        fi
+    else
+        log_error "Failed to update Claude Code"
+        exit 1
     fi
 }
 
@@ -576,10 +639,21 @@ EOF
 
 main() {
     # Handle special commands first
-    echo "DEBUG: First argument is: ${1:-}"
     case "${1:-}" in
         --check)
             do_check
+            exit 0
+            ;;
+        --claude-version)
+            do_claude_version
+            exit 0
+            ;;
+        --check-update)
+            do_check_update
+            exit 0
+            ;;
+        --update-claude)
+            do_update_claude
             exit 0
             ;;
         --setup)
@@ -646,7 +720,6 @@ main() {
             exit 0
             ;;
         --daemon)
-            echo "DEBUG: Entering daemon mode"
             shift
             if needs_setup; then run_setup; fi
             do_daemon "$@"
@@ -686,6 +759,11 @@ MANAGEMENT:
     rapper --check                  # Check Rapper status
     rapper --setup                  # Run first-time setup
 
+VERSION MANAGEMENT:
+    rapper --claude-version         # Show current Claude Code version
+    rapper --check-update           # Check for Claude Code updates
+    rapper --update-claude          # Update Claude Code to latest version
+
 ENVIRONMENT:
     RAPPER_DIR      Rapper installation directory
     
@@ -698,8 +776,6 @@ EOF
             exit 0
             ;;
     esac
-
-    echo "DEBUG: Reached after esac, first arg was: ${1:-}"
 
     # Auto-setup if needed
     if needs_setup; then
