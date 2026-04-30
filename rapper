@@ -504,7 +504,7 @@ TMUX SESSIONS (interactive):
     rapper --list                   # List Tmux sessions
 
 BACKGROUND TASKS (autonomous):
-    rapper --background <name> -p "task"   # Start background task
+    rapper --background <name> -p "task" --workdir /path  # Start background task
     rapper --background <name> --worktree -p "task" -w /project  # Isolated git worktree
     rapper --tasks [status]                # List tasks
     rapper --status <task_id>              # Get task status

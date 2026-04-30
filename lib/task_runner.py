@@ -68,6 +68,7 @@ class Task:
             "name": self.name,
             "prompt": self.prompt[:500] + "..." if len(self.prompt) > 500 else self.prompt,
             "workdir": self.workdir,
+            "workdir_effective": os.getcwd(),  # Actual current working directory
             "status": self.status,
             "pid": self.pid,
             "start_time": self.start_time,
@@ -121,6 +122,7 @@ class Task:
                 repo_workdir=data.get("repo_workdir"),
                 progress=data.get("progress", []),
             )
+            # Note: workdir_effective is not stored in Task object, only in JSON for status reporting
             return task
         except Exception:
             return None
@@ -833,7 +835,17 @@ def main():
         # Second child: the actual daemon
         # Close standard file descriptors
         sys.stdin.close()
-        
+
+        # Change to task workdir before running Claude
+        try:
+            os.chdir(task.workdir)
+        except OSError as e:
+            task.status = "failed"
+            task.error = f"Failed to change directory to {task.workdir}: {e}"
+            task.end_time = time.time()
+            task.save()
+            os._exit(1)
+
         # Run the task synchronously in daemon process
         runner = TaskRunner()
         runner._run_task_sync(task, max_turns=args.max_turns)
