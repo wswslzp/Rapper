@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -62,7 +63,15 @@ class Task:
     @property
     def log_file(self) -> Path:
         return TASK_DIR / f"{self.id}.log"
-    
+
+    @property
+    def audit_file(self) -> Path:
+        return TASK_DIR / f"{self.id}.audit.json"
+
+    @property
+    def progress_file(self) -> Path:
+        return TASK_DIR / f"{self.id}.progress"
+
     def save(self):
         """Save task state to disk."""
         data = {
@@ -158,6 +167,65 @@ def generate_task_id() -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = ''.join(random.choices(string.ascii_lowercase, k=4))
     return f"{ts}-{suffix}"
+
+
+def write_audit_event(task_id: str, event_type: str, **kwargs):
+    """Write an audit event to the audit trail file.
+
+    Args:
+        task_id: Task identifier
+        event_type: Type of event (task_start, tool_summary, task_end, error)
+        **kwargs: Additional event data
+    """
+    audit_file = TASK_DIR / f"{task_id}.audit.json"
+
+    event = {
+        "type": event_type,
+        "time": int(time.time()),
+        **kwargs
+    }
+
+    # Load existing events or create new list
+    events = []
+    if audit_file.exists():
+        try:
+            with open(audit_file, "r") as f:
+                data = json.load(f)
+                events = data.get("events", [])
+        except (json.JSONDecodeError, KeyError):
+            events = []
+
+    # Append new event
+    events.append(event)
+
+    # Write audit file
+    audit_data = {
+        "task_id": task_id,
+        "events": events
+    }
+
+    # Atomic write
+    tmp_file = audit_file.with_suffix(".tmp")
+    with open(tmp_file, "w") as f:
+        json.dump(audit_data, f, indent=2)
+    tmp_file.rename(audit_file)
+
+
+def write_progress(task_id: str, message: str):
+    """Write a progress message to the progress file.
+
+    Args:
+        task_id: Task identifier
+        message: Progress message to append
+    """
+    progress_file = TASK_DIR / f"{task_id}.progress"
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+
+    # Append to progress file
+    with open(progress_file, "a") as f:
+        f.write(line)
 
 
 def setup_worktree(name: str, workdir: str) -> tuple[str, str]:
@@ -282,11 +350,11 @@ def _parse_structured_result(result_text: str) -> dict | None:
     return None
 
 
-def _add_structured_result_instructions(prompt: str) -> str:
+def _add_structured_result_instructions(prompt: str, task_id: str | None = None) -> str:
     """Add structured result output instructions to the prompt.
 
     Appends instructions for Claude to output structured result JSON
-    at the end of the task completion.
+    at the end of the task completion, and optionally progress reporting instructions.
     """
     structured_instructions = """
 
@@ -303,6 +371,20 @@ The structured_result should contain:
 - errors: array of error messages (if any)
 
 This structured result will be parsed automatically for integration with Hermes."""
+
+    if task_id:
+        progress_instructions = f"""
+
+PROGRESS REPORTING: For long-running tasks, you can report progress by writing messages to your progress file. Use bash commands like:
+
+```bash
+echo "Started implementation phase" >> ~/.rapper/tasks/{task_id}.progress
+echo "Completed file analysis, found 5 components" >> ~/.rapper/tasks/{task_id}.progress
+echo "Generated tests, running validation" >> ~/.rapper/tasks/{task_id}.progress
+```
+
+These progress messages will be monitored by Hermes and can trigger notifications. Use this for major milestones or when tasks will take more than a few minutes."""
+        structured_instructions += progress_instructions
 
     return prompt + structured_instructions
 
@@ -429,8 +511,8 @@ class TaskRunner:
         workdir = workdir or os.getcwd()
         model = model or self.default_model
 
-        # Add structured result instructions to prompt
-        enhanced_prompt = _add_structured_result_instructions(prompt)
+        # Add structured result and progress instructions to prompt
+        enhanced_prompt = _add_structured_result_instructions(prompt, task_id)
 
         # Capture Claude Code version
         claude_version = None
@@ -503,15 +585,27 @@ class TaskRunner:
             task.status = "failed"
             task.error = str(e)
             task.end_time = time.time()
+
+            # Write audit event for early failure
+            write_audit_event(
+                task.id,
+                "error",
+                message=str(e),
+                duration_sec=int(task.elapsed()) if task.start_time else 0
+            )
+
             task.save()
             log_file.close()
             return task
-        
+
         task.status = "running"
         task.pid = proc.pid
         task.start_time = time.time()
         task.save()
-        
+
+        # Write audit event for task start
+        write_audit_event(task.id, "task_start", agent_id="rapper-1")
+
         self._running_tasks[task_id] = proc
         
         # Start monitor thread
@@ -613,10 +707,46 @@ class TaskRunner:
         
         finally:
             task.end_time = time.time()
+
+            # Generate tool usage summary for audit
+            if task.progress:
+                tool_counts = Counter(entry['tool'] for entry in task.progress)
+                write_audit_event(
+                    task.id,
+                    "tool_summary",
+                    tools_used=list(tool_counts.keys()),
+                    total_calls=len(task.progress),
+                    tool_counts=dict(tool_counts)
+                )
+
+            # Write final audit event
+            if task.status == "completed":
+                write_audit_event(
+                    task.id,
+                    "task_end",
+                    status="completed",
+                    duration_sec=int(task.elapsed())
+                )
+            elif task.status == "failed":
+                write_audit_event(
+                    task.id,
+                    "error",
+                    message=task.error or "Task failed",
+                    duration_sec=int(task.elapsed())
+                )
+            else:
+                # Handle other statuses like cancelled
+                write_audit_event(
+                    task.id,
+                    "task_end",
+                    status=task.status,
+                    duration_sec=int(task.elapsed())
+                )
+
             task.save()
             log_file.close()
             self._running_tasks.pop(task.id, None)
-            
+
             if on_complete:
                 try:
                     on_complete(task)
@@ -669,15 +799,27 @@ class TaskRunner:
             task.status = "failed"
             task.error = str(e)
             task.end_time = time.time()
+
+            # Write audit event for early failure
+            write_audit_event(
+                task.id,
+                "error",
+                message=str(e),
+                duration_sec=int(task.elapsed()) if task.start_time else 0
+            )
+
             task.save()
             log_file.close()
             return
-        
+
         task.status = "running"
         task.pid = proc.pid
         task.start_time = time.time()
         task.save()
-        
+
+        # Write audit event for task start
+        write_audit_event(task.id, "task_start", agent_id="rapper-1")
+
         # Monitor synchronously
         start = time.time()
         text_parts = []
@@ -753,6 +895,42 @@ class TaskRunner:
         
         finally:
             task.end_time = time.time()
+
+            # Generate tool usage summary for audit
+            if task.progress:
+                tool_counts = Counter(entry['tool'] for entry in task.progress)
+                write_audit_event(
+                    task.id,
+                    "tool_summary",
+                    tools_used=list(tool_counts.keys()),
+                    total_calls=len(task.progress),
+                    tool_counts=dict(tool_counts)
+                )
+
+            # Write final audit event
+            if task.status == "completed":
+                write_audit_event(
+                    task.id,
+                    "task_end",
+                    status="completed",
+                    duration_sec=int(task.elapsed())
+                )
+            elif task.status == "failed":
+                write_audit_event(
+                    task.id,
+                    "error",
+                    message=task.error or "Task failed",
+                    duration_sec=int(task.elapsed())
+                )
+            else:
+                # Handle other statuses like cancelled
+                write_audit_event(
+                    task.id,
+                    "task_end",
+                    status=task.status,
+                    duration_sec=int(task.elapsed())
+                )
+
             task.save()
             log_file.close()
     
@@ -906,8 +1084,8 @@ def main():
                 print(f"Failed to create worktree: {e}")
                 sys.exit(1)
 
-        # Add structured result instructions to prompt
-        enhanced_prompt = _add_structured_result_instructions(prompt)
+        # Add structured result and progress instructions to prompt
+        enhanced_prompt = _add_structured_result_instructions(prompt, task_id)
 
         task = Task(
             id=task_id,
@@ -952,6 +1130,15 @@ def main():
             task.status = "failed"
             task.error = f"Failed to change directory to {task.workdir}: {e}"
             task.end_time = time.time()
+
+            # Write audit event for directory change failure
+            write_audit_event(
+                task.id,
+                "error",
+                message=f"Failed to change directory to {task.workdir}: {e}",
+                duration_sec=0
+            )
+
             task.save()
             os._exit(1)
 
