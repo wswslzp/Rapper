@@ -37,6 +37,11 @@ safety:
       # - "#general"
       # - "C01234ABCDE"
 
+    # HTTP hosts for API calls (scheduled tasks only)
+    http:
+      - "localhost:3456"     # Agent Board API
+      - "127.0.0.1:3456"     # Agent Board API (alt)
+
 tmux:
   # Default session name suffix (will become rapper-<name>)
   default_session_name: "default"

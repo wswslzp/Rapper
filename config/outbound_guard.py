@@ -65,15 +65,16 @@ def _flatten(items: Any) -> list[str]:
 def load_whitelist() -> dict[str, set[str]]:
     """Load allowed targets from ~/.rapper/config.yaml."""
     cfg = _read_yaml(os.path.expanduser("~/.rapper/config.yaml"))
-    
+
     safety = cfg.get("safety", {}) or {}
     wl = safety.get("outbound_whitelist", {}) or {}
-    
+
     return {
         "discord_channels": set(_flatten(wl.get("discord", []))),
         "telegram_chats": set(_flatten(wl.get("telegram", []))),
         "emails": {e.lower() for e in _flatten(wl.get("email", []))},
         "slack_channels": set(_flatten(wl.get("slack", []))),
+        "http_hosts": set(_flatten(wl.get("http", []))),
     }
 
 
@@ -174,12 +175,38 @@ def _check_bash_http(tool_input: dict, wl: dict[str, set[str]]) -> tuple[bool, s
     cmd = tool_input.get("command", "") or ""
     if not isinstance(cmd, str) or not cmd:
         return True, ""
-    
+
     m = _HTTP_POST_RE.search(cmd)
     if m:
+        # Extract URL/host from the command to check whitelist
+        url_patterns = [
+            r"curl\b[^\n]*\s+(https?://[^\s]+)",
+            r"wget\b[^\n]*\s+(https?://[^\s]+)",
+        ]
+        url_match = None
+        for pattern in url_patterns:
+            url_match = re.search(pattern, cmd, re.IGNORECASE)
+            if url_match:
+                break
+
+        if url_match:
+            url = url_match.group(1)
+            # Extract host from URL
+            import urllib.parse
+            try:
+                parsed = urllib.parse.urlparse(url)
+                host_with_port = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+
+                # Check if this host is whitelisted
+                if host_with_port in wl["http_hosts"] or parsed.hostname in wl["http_hosts"]:
+                    return True, ""
+            except Exception:
+                pass  # If URL parsing fails, fall through to block
+
         return False, (
             f"bash command contains outbound HTTP write ({m.group(0)!r}). "
-            f"Scheduled tasks must use proper send tools, not raw HTTP."
+            f"To allow this target, add it to ~/.rapper/config.yaml under "
+            f"safety.outbound_whitelist.http (e.g. 'localhost:3456')."
         )
     return True, ""
 
