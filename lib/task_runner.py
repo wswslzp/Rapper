@@ -43,6 +43,7 @@ class Task:
     end_time: float | None = None
     exit_code: int | None = None
     result: str | None = None
+    structured_result: dict | None = None  # Parsed structured output from Claude
     error: str | None = None
     fail_reason: str | None = None   # error_max_turns | error_budget | (other)
     session_id: str | None = None    # Claude session ID for --resume continuation
@@ -74,6 +75,7 @@ class Task:
             "end_time": self.end_time,
             "exit_code": self.exit_code,
             "result": self.result,
+            "structured_result": self.structured_result,
             "error": self.error,
             "fail_reason": self.fail_reason,
             "session_id": self.session_id,
@@ -111,6 +113,7 @@ class Task:
                 end_time=data.get("end_time"),
                 exit_code=data.get("exit_code"),
                 result=data.get("result"),
+                structured_result=data.get("structured_result"),
                 error=data.get("error"),
                 fail_reason=data.get("fail_reason"),
                 session_id=data.get("session_id"),
@@ -230,6 +233,73 @@ def _make_worktree_safe_prompt(prompt: str, repo_workdir: str, worktree_path: st
     )
 
     return guard + safe_prompt
+
+
+def _parse_structured_result(result_text: str) -> dict | None:
+    """Parse structured result JSON from Claude's text output.
+
+    Looks for JSON blocks in the format:
+    ```json
+    {"structured_result": {...}}
+    ```
+
+    Returns the structured_result dict if found, None otherwise.
+    """
+    import re
+
+    if not result_text:
+        return None
+
+    # Look for JSON code blocks
+    json_pattern = r'```json\s*(\{[^`]+\})\s*```'
+    matches = re.findall(json_pattern, result_text, re.DOTALL | re.IGNORECASE)
+
+    for match in matches:
+        try:
+            parsed = json.loads(match)
+            if isinstance(parsed, dict) and "structured_result" in parsed:
+                return parsed["structured_result"]
+        except json.JSONDecodeError:
+            continue
+
+    # Also try to find standalone JSON at end of text
+    lines = result_text.strip().split('\n')
+    for i in range(len(lines) - 1, max(len(lines) - 10, 0) - 1, -1):
+        line = lines[i].strip()
+        if line.startswith('{') and line.endswith('}'):
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict) and "structured_result" in parsed:
+                    return parsed["structured_result"]
+            except json.JSONDecodeError:
+                continue
+
+    return None
+
+
+def _add_structured_result_instructions(prompt: str) -> str:
+    """Add structured result output instructions to the prompt.
+
+    Appends instructions for Claude to output structured result JSON
+    at the end of the task completion.
+    """
+    structured_instructions = """
+
+IMPORTANT: When you complete this task, include a structured result at the end of your response in the following JSON format:
+
+```json
+{"structured_result": {"status": "completed", "output_path": "path/to/artifact", "summary": "one line summary of what was done", "errors": []}}
+```
+
+The structured_result should contain:
+- status: "completed", "failed", or "partial"
+- output_path: relative path to main artifact/file created/modified (if any)
+- summary: one sentence describing what was accomplished
+- errors: array of error messages (if any)
+
+This structured result will be parsed automatically for integration with Hermes."""
+
+    return prompt + structured_instructions
 
 
 def remove_worktree(worktree_path: str, workdir: str) -> bool:
@@ -354,10 +424,13 @@ class TaskRunner:
         workdir = workdir or os.getcwd()
         model = model or self.default_model
         
+        # Add structured result instructions to prompt
+        enhanced_prompt = _add_structured_result_instructions(prompt)
+
         task = Task(
             id=task_id,
             name=name,
-            prompt=prompt,
+            prompt=enhanced_prompt,
             workdir=workdir,
             status="pending",
             max_budget_usd=max_budget_usd,
@@ -506,6 +579,9 @@ class TaskRunner:
                 if proc.returncode == 0:
                     task.status = "completed"
                     task.result = final_result or "\n".join(text_parts[-10:])
+                    # Parse structured result from the text output
+                    full_text = "\n".join(text_parts)
+                    task.structured_result = _parse_structured_result(task.result or full_text)
                 else:
                     task.status = "failed"
                     task.error = task.error or f"Exit code {proc.returncode}"
@@ -643,6 +719,9 @@ class TaskRunner:
                 if proc.returncode == 0:
                     task.status = "completed"
                     task.result = final_result or "\n".join(text_parts[-10:])
+                    # Parse structured result from the text output
+                    full_text = "\n".join(text_parts)
+                    task.structured_result = _parse_structured_result(task.result or full_text)
                 else:
                     task.status = "failed"
                     task.error = task.error or f"Exit code {proc.returncode}"
@@ -748,6 +827,15 @@ def main():
             print(f"Reason:  {task.fail_reason}")
         if task.session_id:
             print(f"Session: {task.session_id}  # use with: claude -p '...' --resume <session_id>")
+        if task.structured_result:
+            print(f"\nStructured Result:")
+            print(f"  Status: {task.structured_result.get('status', 'unknown')}")
+            if task.structured_result.get('output_path'):
+                print(f"  Output: {task.structured_result['output_path']}")
+            if task.structured_result.get('summary'):
+                print(f"  Summary: {task.structured_result['summary']}")
+            if task.structured_result.get('errors'):
+                print(f"  Errors: {task.structured_result['errors']}")
         if task.result:
             print(f"\nResult:\n{task.result[:1000]}")
         if task.progress:
@@ -798,10 +886,13 @@ def main():
                 print(f"Failed to create worktree: {e}")
                 sys.exit(1)
 
+        # Add structured result instructions to prompt
+        enhanced_prompt = _add_structured_result_instructions(prompt)
+
         task = Task(
             id=task_id,
             name=args.name,
-            prompt=prompt,
+            prompt=enhanced_prompt,
             workdir=workdir,
             status="pending",
             max_budget_usd=args.budget,
