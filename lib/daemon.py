@@ -79,7 +79,7 @@ class AgentBoardClient:
         }
 
         if self.api_key:
-            headers['Authorization'] = f'Bearer {self.api_key}'
+            headers['X-API-Key'] = self.api_key
 
         body = json.dumps(data).encode('utf-8') if data else None
 
@@ -121,17 +121,30 @@ class AgentBoardClient:
         """Get tasks assigned to this agent."""
         try:
             response = self._make_request('GET', f'/api/tasks?assignee={assignee}&column={column}')
+            # API returns a list directly, not a {"tasks": [...]} wrapper
+            if isinstance(response, list):
+                return response
             return response.get('tasks', [])
         except (HTTPError, URLError, json.JSONDecodeError):
             return []
 
-    def update_task_status(self, task_id: str, status: str, comment: Optional[str] = None) -> bool:
+    def update_task_status(self, task_id: str, status: str, comment: Optional[str] = None,
+                           author: Optional[str] = None) -> bool:
         """Update task status on Agent Board."""
+        # Map status strings to column names
+        status_to_column = {
+            'in_progress': 'doing',
+            'doing': 'doing',
+            'done': 'done',
+            'failed': 'failed',
+            'todo': 'todo',
+        }
+        column = status_to_column.get(status, status)
         try:
-            data = {'status': status}
-            if comment:
-                data['comment'] = comment
-            self._make_request('PATCH', f'/api/tasks/{task_id}', data)
+            self._make_request('PATCH', f'/api/tasks/{task_id}', {'column': column})
+            if comment and author:
+                self._make_request('POST', f'/api/tasks/{task_id}/comments',
+                                   {'author': author, 'text': comment})
             return True
         except (HTTPError, URLError, json.JSONDecodeError):
             return False
@@ -305,6 +318,12 @@ class RapperDaemon:
         try:
             response = self.client.register_agent(self.agent_info)
             self.logger.info(f"Registered with Agent Board: {response}")
+        except HTTPError as e:
+            if e.code == 409:
+                self.logger.warning(f"Agent {self.agent_id} already registered with Agent Board (409 Conflict), continuing...")
+            else:
+                self.logger.error(f"Failed to register with Agent Board: HTTP {e.code}")
+                raise
         except Exception as e:
             self.logger.error(f"Failed to register with Agent Board: {e}")
             raise
@@ -328,11 +347,19 @@ class RapperDaemon:
                 self.logger.debug("No tasks found")
                 return
 
+            # Check concurrency limit before processing tasks
+            running_count = self._count_running_tasks()
+            max_concurrent = self.config.get('tasks', {}).get('max_concurrent_tasks', 5)
+
+            if running_count >= max_concurrent:
+                self.logger.warning(f"Concurrency limit reached: {running_count}/{max_concurrent}, skipping task execution")
+                return
+
             # Process first available task
             board_task = tasks[0]
             task_id = board_task['id']
 
-            self.logger.info(f"Found task: {task_id}")
+            self.logger.info(f"Found task: {task_id} (current load: {running_count}/{max_concurrent})")
 
             # Create internal task
             internal_task = Task(
@@ -371,6 +398,16 @@ class RapperDaemon:
 
         except Exception as e:
             self.logger.error(f"Error in task polling: {e}")
+
+    def _count_running_tasks(self) -> int:
+        """Count currently running tasks across all agents."""
+        from task_runner import list_tasks
+        try:
+            running_tasks = list_tasks(status="running", limit=100)
+            return len(running_tasks)
+        except Exception as e:
+            self.logger.error(f"Error counting running tasks: {e}")
+            return 0
 
     def _handle_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully."""

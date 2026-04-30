@@ -614,6 +614,13 @@ main() {
             do_task_list "${1:-}"
             exit 0
             ;;
+        --task-count)
+            shift
+            if needs_setup; then run_setup; fi
+            # Output just the running task count for Hermes integration
+            echo "$(count_running_tasks)"
+            exit 0
+            ;;
         --status)
             shift
             if needs_setup; then run_setup; fi
@@ -666,6 +673,7 @@ BACKGROUND TASKS (autonomous):
     rapper --background <name> -p "task" --workdir /path  # Start background task
     rapper --background <name> --worktree -p "task" -w /project  # Isolated git worktree
     rapper --tasks [status]                # List tasks
+    rapper --task-count                    # Get count of running tasks (for concurrency control)
     rapper --status <task_id>              # Get task status
     rapper --logs <task_id> [lines]        # View task logs
     rapper --cancel <task_id>              # Cancel running task

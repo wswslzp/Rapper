@@ -290,13 +290,13 @@ def _add_structured_result_instructions(prompt: str) -> str:
 IMPORTANT: When you complete this task, include a structured result at the end of your response in the following JSON format:
 
 ```json
-{"structured_result": {"status": "completed", "output_path": "path/to/artifact", "summary": "one line summary of what was done", "errors": []}}
+{"structured_result": {"status": "completed", "output_path": "path/to/artifact", "pr_url": null, "errors": []}}
 ```
 
 The structured_result should contain:
 - status: "completed", "failed", or "partial"
 - output_path: relative path to main artifact/file created/modified (if any)
-- summary: one sentence describing what was accomplished
+- pr_url: GitHub pull request URL if one was created (null otherwise)
 - errors: array of error messages (if any)
 
 This structured result will be parsed automatically for integration with Hermes."""
@@ -834,8 +834,8 @@ def main():
             print(f"  Status: {task.structured_result.get('status', 'unknown')}")
             if task.structured_result.get('output_path'):
                 print(f"  Output: {task.structured_result['output_path']}")
-            if task.structured_result.get('summary'):
-                print(f"  Summary: {task.structured_result['summary']}")
+            if task.structured_result.get('pr_url'):
+                print(f"  PR URL: {task.structured_result['pr_url']}")
             if task.structured_result.get('errors'):
                 print(f"  Errors: {task.structured_result['errors']}")
         if task.result:
