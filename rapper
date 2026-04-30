@@ -269,7 +269,7 @@ count_running_tasks() {
     fi
 
     local count=0
-    for task_file in "$tasks_dir"/*.json 2>/dev/null; do
+    for task_file in "$tasks_dir"/*.json; do
         [[ -f "$task_file" ]] || continue
         local status=$(python3 -c "
 import json, sys
