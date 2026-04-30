@@ -1,6 +1,7 @@
 #!/bin/bash
 #
 # Rapper 🎤 — Claude Code wrapper with safety guardrails
+echo "TESTING: Script is running"
 #
 # Usage:
 #   rapper                    # Interactive mode
@@ -485,10 +486,97 @@ do_background() {
     "${cmd[@]}"
 }
 
+# --- Daemon Mode ---
+
+do_daemon() {
+    local agent_id=""
+    local log_level=""
+
+    # Parse daemon-specific args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --agent-id)
+                shift
+                agent_id="${1:-}"
+                ;;
+            --log-level)
+                shift
+                log_level="${1:-}"
+                ;;
+            --help|-h)
+                cat << 'EOF'
+Rapper Daemon Mode
+
+USAGE:
+    rapper --daemon [OPTIONS]
+
+OPTIONS:
+    --agent-id <id>         Override agent ID (auto-generated if not specified)
+    --log-level <level>     Set log level (debug, info, warning, error)
+    --help                  Show this help
+
+DESCRIPTION:
+    Starts Rapper in persistent daemon mode for Agent Board integration.
+
+    The daemon will:
+    - Register with Agent Board as an available agent
+    - Poll for assigned tasks and execute them
+    - Listen for webhook notifications for instant task assignment
+    - Handle graceful shutdown and cleanup
+
+CONFIG:
+    Configuration is read from ~/.rapper/config.yaml
+    Agent Board settings can be found under the 'agent_board' section.
+
+SIGNALS:
+    SIGTERM, SIGINT - Graceful shutdown with task cleanup
+EOF
+                return 0
+                ;;
+            *)
+                log_error "Unknown daemon option: $1"
+                log_error "Use 'rapper --daemon --help' for usage information"
+                exit 1
+                ;;
+        esac
+        shift 2>/dev/null || break
+    done
+
+    log_info "Starting Rapper daemon mode..."
+
+    # Check config exists
+    if [[ ! -f "$RAPPER_CONFIG" ]]; then
+        log_error "Config file not found: $RAPPER_CONFIG"
+        log_error "Run 'rapper --setup' first"
+        exit 1
+    fi
+
+    # Build command
+    local cmd=(
+        "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/daemon.py"
+        --config "$RAPPER_CONFIG"
+    )
+
+    if [[ -n "$agent_id" ]]; then
+        cmd+=(--agent-id "$agent_id")
+    fi
+
+    if [[ -n "$log_level" ]]; then
+        cmd+=(--log-level "$log_level")
+    fi
+
+    # Set environment
+    export RAPPER_DIR
+
+    # Execute daemon
+    exec "${cmd[@]}"
+}
+
 # --- Main ---
 
 main() {
     # Handle special commands first
+    echo "DEBUG: First argument is: ${1:-}"
     case "${1:-}" in
         --check)
             do_check
@@ -550,6 +638,13 @@ main() {
             do_merge "${1:?Task ID required}"
             exit 0
             ;;
+        --daemon)
+            echo "DEBUG: Entering daemon mode"
+            shift
+            if needs_setup; then run_setup; fi
+            do_daemon "$@"
+            exit 0
+            ;;
         --help|-h)
             cat << 'EOF'
 Rapper 🎤 — Claude Code wrapper with safety guardrails
@@ -576,6 +671,9 @@ BACKGROUND TASKS (autonomous):
     rapper --cancel <task_id>              # Cancel running task
     rapper --merge <task_id>               # Merge worktree branch + cleanup
 
+DAEMON MODE (Agent Board):
+    rapper --daemon [--agent-id <id>] [--log-level <level>]  # Start persistent daemon
+
 MANAGEMENT:
     rapper --check                  # Check Rapper status
     rapper --setup                  # Run first-time setup
@@ -592,12 +690,14 @@ EOF
             exit 0
             ;;
     esac
-    
+
+    echo "DEBUG: Reached after esac, first arg was: ${1:-}"
+
     # Auto-setup if needed
     if needs_setup; then
         run_setup
     fi
-    
+
     # Pass through to Claude Code
     exec claude "$@"
 }
