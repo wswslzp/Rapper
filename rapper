@@ -475,6 +475,7 @@ do_background() {
     local fallback_model=""
     local use_worktree=false
     local max_turns="200"
+    local board_task_id=""
 
     # Check concurrent tasks limit
     local running_count max_concurrent
@@ -513,6 +514,10 @@ do_background() {
                 shift
                 max_turns="${1:-200}"
                 ;;
+            --board-task-id)
+                shift
+                board_task_id="${1:-}"
+                ;;
             *)
                 # If no -p flag, treat remaining as prompt
                 if [[ -z "$prompt" ]]; then
@@ -524,7 +529,7 @@ do_background() {
     done
 
     if [[ -z "$prompt" ]]; then
-        log_error "Usage: rapper --background <name> -p 'prompt' [-w workdir] [--budget <usd>] [--fallback <model>] [--max-turns <n>]"
+        log_error "Usage: rapper --background <name> -p 'prompt' [-w workdir] [--budget <usd>] [--fallback <model>] [--max-turns <n>] [--board-task-id <id>]"
         exit 1
     fi
 
@@ -544,6 +549,10 @@ do_background() {
 
     if [[ "$use_worktree" == "true" ]]; then
         cmd+=(--worktree)
+    fi
+
+    if [[ -n "$board_task_id" ]]; then
+        cmd+=(--board-task-id "$board_task_id")
     fi
 
     "${cmd[@]}"
@@ -745,6 +754,7 @@ TMUX SESSIONS (interactive):
 BACKGROUND TASKS (autonomous):
     rapper --background <name> -p "task" --workdir /path  # Start background task
     rapper --background <name> --worktree -p "task" -w /project  # Isolated git worktree
+    rapper --background <name> --board-task-id task_xyz -p "task"  # Bind to Agent Board task
     rapper --tasks [status]                # List tasks
     rapper --task-count                    # Get count of running tasks (for concurrency control)
     rapper --status <task_id>              # Get task status

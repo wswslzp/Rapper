@@ -20,11 +20,18 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 # Task directory
 TASK_DIR = Path(os.path.expanduser("~/.rapper/tasks"))
@@ -54,6 +61,7 @@ class Task:
     branch_name: str | None = None        # 如 rapper/feat-auth
     repo_workdir: str | None = None       # 主 repo 路径（worktree 模式下与 workdir 不同）
     claude_version: str | None = None     # Claude Code version when task started
+    board_task_id: str | None = None      # Agent Board task ID (e.g., task_7f25a48f)
     progress: list[dict] = field(default_factory=list)  # tool calls
     
     @property
@@ -96,6 +104,7 @@ class Task:
             "branch_name": self.branch_name,
             "repo_workdir": self.repo_workdir,
             "claude_version": self.claude_version,
+            "board_task_id": self.board_task_id,
             "progress": self.progress[-20:],  # Keep last 20 tool calls
             "updated_at": time.time(),
         }
@@ -135,6 +144,7 @@ class Task:
                 branch_name=data.get("branch_name"),
                 repo_workdir=data.get("repo_workdir"),
                 claude_version=data.get("claude_version"),
+                board_task_id=data.get("board_task_id"),
                 progress=data.get("progress", []),
             )
             # Note: workdir_effective is not stored in Task object, only in JSON for status reporting
@@ -158,6 +168,73 @@ class Task:
             return f"{secs // 60}m {secs % 60}s"
         else:
             return f"{secs // 3600}h {(secs % 3600) // 60}m"
+
+
+def load_config() -> dict:
+    """Load configuration from ~/.rapper/config.yaml with defaults."""
+    config_path = os.path.expanduser("~/.rapper/config.yaml")
+    defaults = {
+        "progress_reporting": {
+            "enabled": True,
+            "report_every_n_tools": 5,
+            "board_url": "http://localhost:3456"
+        },
+        "agent_board": {
+            "api_key": ""
+        }
+    }
+
+    if not yaml or not os.path.exists(config_path):
+        return defaults
+
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+
+        # Merge with defaults
+        result = defaults.copy()
+        if "progress_reporting" in config:
+            result["progress_reporting"].update(config["progress_reporting"])
+        if "agent_board" in config:
+            result["agent_board"].update(config["agent_board"])
+
+        return result
+    except Exception:
+        return defaults
+
+
+def post_board_comment(board_task_id: str, message: str, config: dict) -> bool:
+    """Post a comment to the Board task. Returns True if successful, False otherwise."""
+    if not board_task_id:
+        return False
+
+    try:
+        progress_config = config.get("progress_reporting", {})
+        board_url = progress_config.get("board_url", "http://localhost:3456")
+        api_key = config.get("agent_board", {}).get("api_key", "")
+
+        url = f"{board_url}/api/tasks/{board_task_id}/comments"
+
+        # Prepare the request data
+        data = json.dumps({
+            "content": message,
+            "author": "rapper-agent"
+        }).encode('utf-8')
+
+        # Create the request
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+
+        if api_key:
+            req.add_header('Authorization', f'Bearer {api_key}')
+
+        # Make the request with timeout
+        with urllib.request.urlopen(req, timeout=3) as response:
+            return response.status == 200 or response.status == 201
+
+    except Exception:
+        # Silent failure - don't interrupt task execution
+        return False
 
 
 def generate_task_id() -> str:
@@ -421,18 +498,24 @@ def list_tasks(status: str | None = None, limit: int = 20) -> list[Task]:
 
 
 def get_task(task_id: str) -> Task | None:
-    """Get a task by ID or name prefix."""
+    """Get a task by ID, board task ID, or name prefix."""
     # Try exact match first
     task = Task.load(task_id)
     if task:
         return task
-    
+
+    # Try board task ID match
+    for task_file in TASK_DIR.glob("*.json"):
+        t = Task.load(task_file.stem)
+        if t and t.board_task_id == task_id:
+            return t
+
     # Try name prefix match
     for task_file in TASK_DIR.glob("*.json"):
         t = Task.load(task_file.stem)
         if t and t.name.startswith(task_id):
             return t
-    
+
     return None
 
 
@@ -490,6 +573,7 @@ class TaskRunner:
                    allowed_tools: list[str] | None = None,
                    max_budget_usd: float | None = None,
                    fallback_model: str | None = None,
+                   board_task_id: str | None = None,
                    on_complete: Callable[[Task], None] | None = None,
                    ) -> Task:
         """Start a new background task.
@@ -537,6 +621,7 @@ class TaskRunner:
             max_budget_usd=max_budget_usd,
             fallback_model=fallback_model,
             claude_version=claude_version,
+            board_task_id=board_task_id,
         )
         task.save()
         
@@ -628,6 +713,13 @@ class TaskRunner:
         start = time.time()
         text_parts = []
         final_result = None
+
+        # Load configuration for progress reporting
+        config = load_config()
+        progress_config = config.get("progress_reporting", {})
+        progress_enabled = progress_config.get("enabled", True)
+        report_every = progress_config.get("report_every_n_tools", 5)
+        tool_call_count = 0
         
         try:
             for line in proc.stdout:
@@ -659,6 +751,17 @@ class TaskRunner:
                             "time": time.time() - start,
                         })
                         task.save()
+
+                        # Progress reporting to Board
+                        if progress_enabled and task.board_task_id:
+                            tool_call_count += 1
+                            if tool_call_count % report_every == 0:
+                                elapsed_str = f"{int(time.time() - start)}s"
+                                progress_msg = (
+                                    f"🔄 Progress update: {tool_call_count} steps completed "
+                                    f"({elapsed_str} elapsed). Latest: {tool}"
+                                )
+                                post_board_comment(task.board_task_id, progress_msg, config)
                     
                     # Extract text
                     text = self._extract_text(event)
@@ -744,6 +847,32 @@ class TaskRunner:
                 )
 
             task.save()
+
+            # Post completion/failure comment to Board
+            if progress_enabled and task.board_task_id:
+                if task.status == "completed":
+                    elapsed_str = f"{int(task.elapsed())}s"
+                    steps_count = len(task.progress)
+                    result_summary = ""
+                    if task.structured_result:
+                        status = task.structured_result.get('status', 'unknown')
+                        output_path = task.structured_result.get('output_path', '')
+                        if output_path:
+                            result_summary = f" Output: {output_path}"
+                    completion_msg = (
+                        f"✅ Task completed in {elapsed_str} with {steps_count} steps.{result_summary}"
+                    )
+                    post_board_comment(task.board_task_id, completion_msg, config)
+                elif task.status == "failed":
+                    elapsed_str = f"{int(task.elapsed())}s"
+                    steps_count = len(task.progress)
+                    reason = task.fail_reason or "unknown error"
+                    failure_msg = (
+                        f"❌ Task failed after {elapsed_str} with {steps_count} steps. "
+                        f"Reason: {reason}. Check: rapper --status {task.id}"
+                    )
+                    post_board_comment(task.board_task_id, failure_msg, config)
+
             log_file.close()
             self._running_tasks.pop(task.id, None)
 
@@ -824,6 +953,13 @@ class TaskRunner:
         start = time.time()
         text_parts = []
         final_result = None
+
+        # Load configuration for progress reporting
+        config = load_config()
+        progress_config = config.get("progress_reporting", {})
+        progress_enabled = progress_config.get("enabled", True)
+        report_every = progress_config.get("report_every_n_tools", 5)
+        tool_call_count = 0
         
         try:
             for line in proc.stdout:
@@ -844,7 +980,7 @@ class TaskRunner:
                 
                 try:
                     event = json.loads(stripped)
-                    
+
                     tool = self._extract_tool_name(event)
                     if tool:
                         task.progress.append({
@@ -852,7 +988,18 @@ class TaskRunner:
                             "time": time.time() - start,
                         })
                         task.save()
-                    
+
+                        # Progress reporting to Board
+                        if progress_enabled and task.board_task_id:
+                            tool_call_count += 1
+                            if tool_call_count % report_every == 0:
+                                elapsed_str = f"{int(time.time() - start)}s"
+                                progress_msg = (
+                                    f"🔄 Progress update: {tool_call_count} steps completed "
+                                    f"({elapsed_str} elapsed). Latest: {tool}"
+                                )
+                                post_board_comment(task.board_task_id, progress_msg, config)
+
                     text = self._extract_text(event)
                     if text:
                         text_parts.append(text)
@@ -932,6 +1079,32 @@ class TaskRunner:
                 )
 
             task.save()
+
+            # Post completion/failure comment to Board
+            if progress_enabled and task.board_task_id:
+                if task.status == "completed":
+                    elapsed_str = f"{int(task.elapsed())}s"
+                    steps_count = len(task.progress)
+                    result_summary = ""
+                    if task.structured_result:
+                        status = task.structured_result.get('status', 'unknown')
+                        output_path = task.structured_result.get('output_path', '')
+                        if output_path:
+                            result_summary = f" Output: {output_path}"
+                    completion_msg = (
+                        f"✅ Task completed in {elapsed_str} with {steps_count} steps.{result_summary}"
+                    )
+                    post_board_comment(task.board_task_id, completion_msg, config)
+                elif task.status == "failed":
+                    elapsed_str = f"{int(task.elapsed())}s"
+                    steps_count = len(task.progress)
+                    reason = task.fail_reason or "unknown error"
+                    failure_msg = (
+                        f"❌ Task failed after {elapsed_str} with {steps_count} steps. "
+                        f"Reason: {reason}. Check: rapper --status {task.id}"
+                    )
+                    post_board_comment(task.board_task_id, failure_msg, config)
+
             log_file.close()
     
     def _extract_tool_name(self, event: dict) -> str | None:
@@ -990,6 +1163,7 @@ def main():
     run_p.add_argument("--fallback", help="Fallback model on overload")
     run_p.add_argument("--worktree", action="store_true", help="Use git worktree isolation")
     run_p.add_argument("--max-turns", type=int, default=200, dest="max_turns", help="Maximum Claude turns (default: 200)")
+    run_p.add_argument("--board-task-id", help="Agent Board task ID for binding")
     
     args = parser.parse_args()
     
@@ -1012,6 +1186,8 @@ def main():
         print(f"Name:    {task.name}")
         print(f"Status:  {task.status}")
         print(f"Workdir: {task.workdir}")
+        if task.board_task_id:
+            print(f"Board ID: {task.board_task_id}")
         if task.worktree_path:
             print(f"Worktree: {task.worktree_path}")
         if task.branch_name:
@@ -1098,6 +1274,7 @@ def main():
             worktree_path=worktree_path,
             branch_name=branch_name,
             repo_workdir=repo_workdir,
+            board_task_id=getattr(args, 'board_task_id', None),
         )
         task.save()
         

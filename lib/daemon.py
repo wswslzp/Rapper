@@ -425,7 +425,8 @@ class RapperDaemon:
                 name=board_task.get('title', f"board-{task_id}"),
                 prompt=board_task.get('description', ''),
                 workdir=os.getcwd(),
-                status='pending'
+                status='pending',
+                board_task_id=task_id
             )
 
             self.current_task = (task_id, internal_task)

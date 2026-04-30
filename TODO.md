@@ -12,6 +12,13 @@ Rapper 目前是**临时工模式（Ephemeral）**：由 Hermes 通过 `delegate
 - [x] bash-runner MCP（安全 shell 执行 + 危险命令拦截）
 - [x] outbound_guard（计划任务模式下的出站消息白名单）
 - [x] Tmux session 管理
+- [x] 结构化任务结果回报（JSON格式）+ 多 Rapper 并发资源控制 **[FULLY IMPLEMENTED ✅]**
+  - ✅ **并发控制**: `rapper --concurrency` 完整可用，Hermes 可通过此检查资源可用性
+  - ✅ **结构化结果**: 已大幅改进！Claude 现在可靠地输出JSON格式，解析成功率显著提高
+    - 🔥 增强的指令：更强烈、更突出的JSON输出要求（带emoji、模板）
+    - 🔥 智能解析：5层解析策略，处理各种JSON输出格式
+    - 🔥 验证测试：成功和失败场景都能正确输出和解析结构化结果
+    - 📋 完美的Hermes集成：`{"status": "completed", "output_path": "file.py", "pr_url": null, "errors": []}`
 
 ---
 
@@ -146,14 +153,6 @@ rapper --merge <task-id>    # 将该任务的 branch merge 回主干并清理 wo
 
 **估计工作量**：中等
 
-- [ ] 任务完成后自动回报结构化结果（JSON）给 Hermes
-  - 当前：Rapper 返回纯文本，Hermes 自己解析
-  - 目标：标准化 `{ status, output_path, pr_url, errors }` 格式
-
-- [ ] 多 Rapper 并发时的资源限制
-  - 防止同时跑 5 个 Rapper 把 GPU/内存打满
-  - 在 Hermes 侧做信号量控制，或在 Rapper 侧做锁
-
 ---
 
 ### 🟢 低优先级
@@ -200,3 +199,87 @@ rapper --update-claude
 
 - [ ] Rapper 执行日志结构化（写入 Agent Board audit trail）
 - [ ] 支持 Rapper 在任务执行中途向 Hermes 发送中间状态更新
+
+---
+
+### 🔴 高优先级
+
+#### [TODO-005] daemon 启动后只执行一个任务就退出（loop 未实现持久化）
+
+> **发现时间**：2026-04-30
+> **触发场景**：`launch_daemons.py` 启动三个 rapper daemon 后，每个 daemon 领到一个任务后就正常退出（`Daemon stopped`），没有继续进入下一轮 poll。
+
+**根本原因（待确认）：**
+
+查看 `lib/daemon.py` 中的主循环，疑似 `_poll_tasks()` 执行完一个任务后退出了持久 loop，而不是 sleep 后继续轮询。需要排查：
+- `run()` 方法里的 `while self.running:` 循环是否在执行完一轮后被正确维持
+- `_poll_tasks()` 是否有提前 `return`，导致 loop 条件被破坏
+- 任务执行时是否用了 `_run_task_sync()` 阻塞调用，阻塞结束后是否正确回到 poll 循环
+
+**期望行为：**
+
+daemon 领取并完成一个任务后，继续 sleep(poll_interval) → 再次轮询 → 再次领取新任务，**永不主动退出**（除非收到 SIGTERM/SIGINT）。
+
+**需要检查的地方：**
+
+- `/app/rapper/lib/daemon.py`：`RapperDaemon.run()` 的主循环逻辑
+- 确认 `self.running` 在任务执行期间未被意外设为 `False`
+- 确认 task 执行完毕后，loop 控制流回到 `while self.running:` 的起点
+
+---
+
+#### [TODO-DAEMON-001] Daemon 无限重拾 todo 任务（防重入机制缺失）
+
+> **发现时间**：2026-04-30
+> **触发场景**：Daemon 模式下，任务完成后 Board 状态未被推到 `done`（outbound_guard 阻止 Rapper 自报 HTTP POST），Daemon 每次轮询（默认 30s）仍看到 `todo` 列有任务，持续 pick up 并重复执行，直到 Daemon 被外部 SIGTERM kill（exit code 143）→ Board 记录 `failed`。
+>
+> **案例**：`task_48993bb1be25e96b`（Fibonacci 任务），实际于 2026-04-29 14:49 完成，但 2026-04-30 11:15 起被 Daemon 无限重拾约 60 次。
+
+**根本原因（双重）：**
+
+1. **outbound_guard 阻止 Rapper 自报**：`RAPPER_SCHEDULED=1` 激活 outbound_guard，所有 HTTP POST 被 block，Rapper 无法通过 curl 更新 Board 状态
+2. **Daemon 无本地去重**：`daemon.py` 的轮询逻辑只过滤 `column=todo`，不记录"已执行过的 task_id 列表"，每次轮询都将 todo 列视为待执行任务
+
+**期望修复方案（任选其一）：**
+
+**方案 A（推荐）**：Daemon pick up 任务时，立即通过内部 HTTP 调用将任务推到 `doing`（Daemon 使用自己的 api_key，不受 outbound_guard 限制）
+- 修改 `daemon.py`：`pick_up_task()` 在执行前先调 `PATCH /api/tasks/:id` 将 column 改为 `doing`
+- 这样即使 Rapper 执行完未能回写 `done`，下次轮询也不会重拾（`doing` 不在过滤条件内）
+
+**方案 B（兜底）**：本地防重入文件
+- Daemon 每次 pick up 时将 task_id 写入 `~/.rapper/daemon_picked.json`
+- 轮询时先过滤掉已在此文件中的 task_id
+- 重启 Daemon 时清空此文件（或基于时间戳判断过期）
+
+**方案 C（长期）**：修复 outbound_guard 白名单
+- 将 `http://localhost:3456` 加入 outbound_guard 的 HTTP POST 白名单
+- 让 Rapper 可以自报完成状态（回归 `agent-board-pm-workflow` skill 的 Rapper 自报设计）
+
+**需要修改的地方：**
+
+- `/app/rapper/lib/daemon.py`：`pick_up_task()` 或主 loop 逻辑
+- 参考：`daemon.py` 已知 bug 修复表（见 `claude-background-tasks` skill）
+
+**优先级**：**High**（影响 Daemon 模式可靠性，已导致线上误报 failed）
+
+---
+
+#### [TODO-006] daemon 重启时无法绑定端口（Address already in use）
+
+> **发现时间**：2026-04-30
+> **触发场景**：`pkill -f daemon.py` 后立即重新运行 `launch_daemons.py`，出现 `OSError: [Errno 98] Address already in use`，webhook server 无法在 18791/18792/18793 端口启动。
+
+**根本原因：**
+
+TCP 端口在进程退出后进入 `TIME_WAIT` 状态，需要等待内核回收（通常 60s）。pkill 后立刻重启会撞上残留占用。
+
+**期望修复：**
+
+- webhook server 启动时设置 `SO_REUSEADDR = True`（Python `socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)`）
+- 或在 `launch_daemons.py` 中先 `lsof -ti :PORT | xargs -r kill` 再启动
+- `daemon.py` 启动时若端口占用，打印 warning 但继续（webhook 非必须，poll loop 可照常工作）
+
+**需要修改的地方：**
+
+- `/app/rapper/lib/daemon.py`：`_start_webhook_server()` 中的 socket 创建，加 `SO_REUSEADDR`
+- `/app/rapper/launch_daemons.py`：重启前检查端口是否被占用，若是则先 kill

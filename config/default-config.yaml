@@ -53,6 +53,14 @@ tasks:
   # Maximum number of concurrent background tasks
   max_concurrent_tasks: 5
 
+progress_reporting:
+  # Enable real-time progress reporting to Board comments
+  enabled: true
+  # Report progress every N tool calls
+  report_every_n_tools: 5
+  # Board API endpoint
+  board_url: "http://localhost:3456"
+
 agent_board:
   # Agent Board API configuration for daemon mode
   url: "http://localhost:3456"
