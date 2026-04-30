@@ -240,10 +240,63 @@ do_list() {
     fi
 }
 
+# --- Config parsing ---
+
+get_max_concurrent() {
+    # Get max concurrent tasks from config, default 5
+    local config_file="$RAPPER_CONFIG"
+    if [[ -f "$config_file" ]]; then
+        python3 -c "
+import yaml
+try:
+    with open('$config_file') as f:
+        config = yaml.safe_load(f) or {}
+    print(config.get('tasks', {}).get('max_concurrent_tasks', 5))
+except:
+    print(5)
+" 2>/dev/null || echo 5
+    else
+        echo 5
+    fi
+}
+
+count_running_tasks() {
+    # Count tasks with status 'running'
+    local tasks_dir="${RAPPER_CONFIG_DIR}/tasks"
+    if [[ ! -d "$tasks_dir" ]]; then
+        echo 0
+        return
+    fi
+
+    local count=0
+    for task_file in "$tasks_dir"/*.json 2>/dev/null; do
+        [[ -f "$task_file" ]] || continue
+        local status=$(python3 -c "
+import json, sys
+try:
+    with open('$task_file') as f:
+        data = json.load(f)
+    print(data.get('status', 'unknown'))
+except:
+    print('unknown')
+" 2>/dev/null)
+        if [[ "$status" == "running" ]]; then
+            ((count++))
+        fi
+    done
+    echo "$count"
+}
+
 # --- Task Runner Commands ---
 
 do_task_list() {
     local status="${1:-}"
+    local running_count max_concurrent
+    running_count=$(count_running_tasks)
+    max_concurrent=$(get_max_concurrent)
+
+    echo "Current running: $running_count / $max_concurrent"
+    echo ""
     "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py" list ${status:+--status "$status"}
 }
 
@@ -358,6 +411,17 @@ do_background() {
     local fallback_model=""
     local use_worktree=false
     local max_turns="200"
+
+    # Check concurrent tasks limit
+    local running_count max_concurrent
+    running_count=$(count_running_tasks)
+    max_concurrent=$(get_max_concurrent)
+
+    if [[ "$running_count" -ge "$max_concurrent" ]]; then
+        log_error "Maximum concurrent tasks limit reached: $running_count/$max_concurrent"
+        log_error "Please wait for some tasks to complete or cancel running tasks."
+        exit 1
+    fi
 
     # Parse remaining args
     while [[ $# -gt 0 ]]; do

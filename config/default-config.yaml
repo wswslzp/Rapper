@@ -40,9 +40,13 @@ safety:
 tmux:
   # Default session name suffix (will become rapper-<name>)
   default_session_name: "default"
-  
+
   # Idle timeout in minutes (0 = never)
   idle_timeout: 0
+
+tasks:
+  # Maximum number of concurrent background tasks
+  max_concurrent_tasks: 5
 
 logging:
   enabled: true
