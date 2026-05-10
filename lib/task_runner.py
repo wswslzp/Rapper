@@ -334,6 +334,25 @@ def setup_worktree(name: str, workdir: str) -> tuple[str, str]:
         capture_output=True,
         text=True,
     )
+
+    # Ensure git user identity is configured in the worktree so auto-commit never
+    # fails due to missing user.email / user.name (worktrees in fresh repos may not
+    # inherit a value if neither local nor global git config is set).
+    for key, val in [("user.email", "rapper@localhost"), ("user.name", "Rapper Agent")]:
+        chk = subprocess.run(
+            ["git", "config", key],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if chk.returncode != 0 or not chk.stdout.strip():
+            subprocess.run(
+                ["git", "config", key, val],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+            )
+
     return worktree_path, branch_name
 
 
@@ -664,9 +683,33 @@ def auto_commit_worktree(task: "Task") -> bool:
     Returns False if commit failed.
     """
     if not task.worktree_path or not os.path.isdir(task.worktree_path):
+        print(
+            f"[rapper/auto-commit] WARNING: task {task.id} has no valid worktree_path ({task.worktree_path})",
+            file=sys.stderr,
+        )
         return False
 
     try:
+        # Ensure git user identity is set in the worktree so commits never fail
+        # due to missing user.email / user.name (even in fresh repos with no local config).
+        # We only set it if the worktree doesn't already inherit a value.
+        for key, val in [("user.email", "rapper@localhost"), ("user.name", "Rapper Agent")]:
+            chk = subprocess.run(
+                ["git", "config", key],
+                cwd=task.worktree_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if chk.returncode != 0 or not chk.stdout.strip():
+                subprocess.run(
+                    ["git", "config", key, val],
+                    cwd=task.worktree_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
         # Check for uncommitted changes
         result = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -679,33 +722,61 @@ def auto_commit_worktree(task: "Task") -> bool:
         if not dirty:
             return True  # Already clean, nothing to commit
 
+        print(
+            f"[rapper/auto-commit] task {task.id}: staging+committing uncommitted changes",
+            file=sys.stderr,
+        )
+
         # Stage all changes
-        subprocess.run(
+        add_result = subprocess.run(
             ["git", "add", "-A"],
             cwd=task.worktree_path,
-            check=True,
             capture_output=True,
             text=True,
             timeout=30,
         )
+        if add_result.returncode != 0:
+            print(
+                f"[rapper/auto-commit] ERROR: git add -A failed for task {task.id}: {add_result.stderr}",
+                file=sys.stderr,
+            )
+            return False
 
         # Commit with task metadata
         task_name = task.name or task.id
         branch_short = (task.branch_name or "").replace("rapper/", "")
         commit_msg = f"feat({branch_short}): task '{task_name}' completed by rapper"
-        subprocess.run(
+        commit_result = subprocess.run(
             ["git", "commit", "-m", commit_msg],
             cwd=task.worktree_path,
-            check=True,
             capture_output=True,
             text=True,
             timeout=30,
         )
+        if commit_result.returncode != 0:
+            print(
+                f"[rapper/auto-commit] ERROR: git commit failed for task {task.id}: {commit_result.stderr}",
+                file=sys.stderr,
+            )
+            return False
+
+        print(
+            f"[rapper/auto-commit] task {task.id}: committed — {commit_msg}",
+            file=sys.stderr,
+        )
         return True
 
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[rapper/auto-commit] ERROR: subprocess error for task {task.id}: {e}",
+            file=sys.stderr,
+        )
         return False
-    except Exception:
+    except Exception as e:
+        print(
+            f"[rapper/auto-commit] ERROR: unexpected error for task {task.id}: {e}",
+            file=sys.stderr,
+        )
         return False
 
 
