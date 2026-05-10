@@ -369,6 +369,80 @@ do_task_status() {
     "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py" status "$task_id"
 }
 
+do_task_count_json() {
+    # Use Python to generate detailed task count information in JSON format
+    "${RAPPER_DIR}/.venv/bin/python3" -c "
+import json
+import time
+import os
+import glob
+from pathlib import Path
+
+# Get basic counts
+tasks_dir = os.path.expanduser('~/.rapper/tasks')
+running_count = 0
+pending_count = 0
+completed_count = 0
+failed_count = 0
+cancelled_count = 0
+
+if os.path.exists(tasks_dir):
+    for task_file in glob.glob(os.path.join(tasks_dir, '*.json')):
+        try:
+            with open(task_file) as f:
+                data = json.load(f)
+            status = data.get('status', 'unknown')
+            if status == 'running':
+                running_count += 1
+            elif status == 'pending':
+                pending_count += 1
+            elif status == 'completed':
+                completed_count += 1
+            elif status == 'failed':
+                failed_count += 1
+            elif status == 'cancelled':
+                cancelled_count += 1
+        except:
+            continue
+
+# Get max concurrent from config (default 5)
+max_concurrent = 5
+try:
+    config_file = os.path.expanduser('~/.rapper/config.yaml')
+    if os.path.exists(config_file):
+        import yaml
+        with open(config_file) as f:
+            config = yaml.safe_load(f) or {}
+        max_concurrent = config.get('tasks', {}).get('max_concurrent_tasks', 5)
+except:
+    pass
+
+# Calculate availability
+at_capacity = running_count >= max_concurrent
+available_slots = max(0, max_concurrent - running_count)
+
+# Output JSON
+data = {
+    'timestamp': int(time.time()),
+    'concurrency': {
+        'running': running_count,
+        'max_concurrent': max_concurrent,
+        'at_capacity': at_capacity,
+        'available_slots': available_slots
+    },
+    'task_counts': {
+        'pending': pending_count,
+        'running': running_count,
+        'completed': completed_count,
+        'failed': failed_count,
+        'cancelled': cancelled_count,
+        'total': pending_count + running_count + completed_count + failed_count + cancelled_count
+    }
+}
+print(json.dumps(data, indent=2))
+"
+}
+
 do_task_logs() {
     local task_id="${1:?Task ID required}"
     shift
@@ -428,21 +502,90 @@ else:
 
     # Auto-commit any uncommitted changes in the worktree (Rapper writes files but doesn't git commit)
     if [[ -n "$worktree_path" ]] && [[ -d "$worktree_path" ]]; then
-        local dirty
+        local dirty untracked_count modified_count
         dirty=$(git -C "$worktree_path" status --porcelain 2>/dev/null)
+
         if [[ -n "$dirty" ]]; then
-            log_info "Worktree has uncommitted changes — auto-committing before merge..."
-            git -C "$worktree_path" add -A
-            git -C "$worktree_path" commit -m "feat(${branch_name##*/}): auto-commit by rapper --merge"
-            log_ok "Auto-committed worktree changes"
+            # Count different types of changes for detailed logging
+            # Note: git --porcelain output has 2-char XY status (e.g. " M", "??", "M ")
+            untracked_count=$(echo "$dirty" | grep -c '^??' || echo 0)
+            modified_count=$(echo "$dirty" | grep -cv '^??' || echo 0)
+
+            log_info "Worktree has uncommitted changes: $untracked_count untracked, $modified_count modified"
+            log_info "Changes:"
+            echo "$dirty" | sed 's/^/  /'
+
+            log_info "Auto-committing before merge..."
+            if git -C "$worktree_path" add -A; then
+                local commit_msg="feat(${branch_name##*/}): auto-commit by rapper --merge"
+                if git -C "$worktree_path" commit -m "$commit_msg"; then
+                    log_ok "Auto-committed worktree changes: $commit_msg"
+
+                    # Verify the commit was created
+                    local last_commit
+                    last_commit=$(git -C "$worktree_path" log -1 --oneline 2>/dev/null)
+                    log_info "Latest commit: $last_commit"
+                else
+                    log_error "Failed to commit changes in worktree"
+                    exit 1
+                fi
+            else
+                log_error "Failed to add changes in worktree"
+                exit 1
+            fi
         else
             log_info "Worktree is clean (no uncommitted changes)"
+
+            # Double-check by listing files to help debug edge cases
+            local file_count
+            file_count=$(find "$worktree_path" -type f ! -path '*/.git/*' | wc -l)
+            log_info "Worktree contains $file_count files"
+
+            # Show git log to verify branch has commits
+            local commit_count
+            commit_count=$(git -C "$worktree_path" rev-list --count HEAD 2>/dev/null || echo 0)
+            log_info "Branch $branch_name has $commit_count commits"
+
+            if [[ "$commit_count" -eq 1 ]]; then
+                log_warn "Warning: Branch has only 1 commit (same as main) - this may result in 'Already up to date'"
+            fi
         fi
+    else
+        log_error "Worktree path not found or invalid: $worktree_path"
+        exit 1
     fi
 
     # Merge the branch
-    if git -C "$merge_target" merge "$branch_name"; then
-        log_ok "Merged $branch_name successfully"
+    log_info "Executing merge: git -C '$merge_target' merge '$branch_name'"
+    local merge_output
+    merge_output=$(git -C "$merge_target" merge "$branch_name" 2>&1)
+    local merge_status=$?
+
+    echo "$merge_output"
+
+    if [[ $merge_status -eq 0 ]]; then
+        # Check if it was a real merge or "Already up to date"
+        if echo "$merge_output" | grep -q "Already up to date\|Already up-to-date"; then
+            log_warn "Merge result: Already up to date"
+            log_warn "This usually means the worktree branch has no new commits."
+            log_warn "Possible causes:"
+            log_warn "  1. Claude didn't create any files in the worktree"
+            log_warn "  2. Files were created but not committed (check auto-commit logic above)"
+            log_warn "  3. Branch was created from wrong base commit"
+
+            # Show diagnostic info
+            log_info "=== Diagnostic Information ==="
+            log_info "Main repo HEAD:    $(git -C "$merge_target" rev-parse HEAD)"
+            log_info "Worktree HEAD:     $(git -C "$worktree_path" rev-parse HEAD 2>/dev/null || echo 'N/A')"
+            log_info "Branch commits:    $(git -C "$merge_target" rev-list --count "$branch_name" 2>/dev/null || echo 'N/A')"
+            log_info "Main commits:      $(git -C "$merge_target" rev-list --count HEAD 2>/dev/null || echo 'N/A')"
+
+            # Still clean up, but warn user
+            log_warn "Continuing with cleanup, but no files were actually merged."
+        else
+            log_ok "Merged $branch_name successfully"
+            log_info "$merge_output"
+        fi
 
         # Remove the worktree
         if [[ -n "$worktree_path" ]] && [[ -d "$worktree_path" ]]; then
@@ -460,7 +603,9 @@ else:
             log_warn "Could not delete branch: $branch_name"
         fi
     else
-        log_error "Merge failed. Resolve conflicts manually, then:"
+        log_error "Merge failed with exit code $merge_status"
+        log_error "Output: $merge_output"
+        log_error "Resolve conflicts manually, then:"
         log_error "  git -C $merge_target merge --continue"
         exit 1
     fi
@@ -529,7 +674,7 @@ do_background() {
     done
 
     if [[ -z "$prompt" ]]; then
-        log_error "Usage: rapper --background <name> -p 'prompt' [-w workdir] [--budget <usd>] [--fallback <model>] [--max-turns <n>] [--board-task-id <id>]"
+        log_error "Usage: rapper --background <name> -p 'prompt' [-w/--workdir <path>] [--worktree] [--budget <usd>] [--fallback <model>] [--max-turns <n>] [--board-task-id <id>]"
         exit 1
     fi
 
@@ -704,6 +849,13 @@ main() {
             echo "$(count_running_tasks)"
             exit 0
             ;;
+        --task-count-json)
+            shift
+            if needs_setup; then run_setup; fi
+            # Output detailed task count info in JSON format for Hermes integration
+            do_task_count_json
+            exit 0
+            ;;
         --status)
             shift
             if needs_setup; then run_setup; fi
@@ -753,10 +905,11 @@ TMUX SESSIONS (interactive):
 
 BACKGROUND TASKS (autonomous):
     rapper --background <name> -p "task" --workdir /path  # Start background task
-    rapper --background <name> --worktree -p "task" -w /project  # Isolated git worktree
+    rapper --background <name> --worktree -p "task" --workdir /project  # Isolated git worktree
     rapper --background <name> --board-task-id task_xyz -p "task"  # Bind to Agent Board task
     rapper --tasks [status]                # List tasks
     rapper --task-count                    # Get count of running tasks (for concurrency control)
+    rapper --task-count-json               # Get detailed task count info in JSON (for Hermes integration)
     rapper --status <task_id>              # Get task status
     rapper --logs <task_id> [lines]        # View task logs
     rapper --cancel <task_id>              # Cancel running task

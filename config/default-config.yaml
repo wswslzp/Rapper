@@ -69,6 +69,13 @@ agent_board:
   poll_interval: 30  # Task polling interval in seconds
   webhook_port: 18789  # Local webhook port for task notifications
 
+board_tools:
+  # Native Kanban tools for Claude Code sessions
+  enabled: true
+  api_url: "http://localhost:3456"
+  api_key: "sk-4429c0b2e53522a890b1c5ab6c0d1fcb"  # rapper-1 API key
+  agent_id: ""  # Agent ID (auto-injected by daemon or CLI)
+
 logging:
   enabled: true
   level: "info"

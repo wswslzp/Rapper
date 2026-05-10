@@ -58,7 +58,7 @@ rapper --background "fix-auth" -p "Fix the auth bug" --workdir /app/project
 rapper --background "add-feature" --worktree -p "Add user login feature" --workdir /app/project
 
 # With cost cap and fallback model
-rapper --background "big-task" -p "Refactor the API" -w /app/project \
+rapper --background "big-task" -p "Refactor the API" --workdir /app/project \
     --budget 2.0 --fallback claude-haiku-3
 
 # Monitor tasks
@@ -145,8 +145,8 @@ Each `--worktree` task gets its own git branch (`rapper/<name>`) and directory (
 
 ```bash
 # Two parallel tasks, no interference
-rapper --background "feat-a" --worktree -p "add feature A" -w /app/project
-rapper --background "feat-b" --worktree -p "add feature B" -w /app/project
+rapper --background "feat-a" --worktree -p "add feature A" --workdir /app/project
+rapper --background "feat-b" --worktree -p "add feature B" --workdir /app/project
 
 # Merge when done
 rapper --merge feat-a

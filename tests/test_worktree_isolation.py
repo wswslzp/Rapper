@@ -4,13 +4,16 @@ Tests for worktree isolation functionality.
 
 Tests the _make_worktree_safe_prompt() function to ensure it properly
 rewrites prompts for safe execution inside git worktrees.
+Also tests auto_commit_worktree() for post-task auto-commit.
 """
 
+import subprocess
 import sys
 import os
+import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from lib.task_runner import _make_worktree_safe_prompt
+from lib.task_runner import _make_worktree_safe_prompt, auto_commit_worktree, Task
 
 
 def test_replaces_absolute_path_with_relative():
@@ -192,6 +195,133 @@ def test_repo_workdir_with_trailing_slash():
     print("✓ test_repo_workdir_with_trailing_slash passed")
 
 
+def _make_test_git_repo() -> tuple[str, str]:
+    """Helper: create a temp git repo with a worktree. Returns (repo_dir, worktree_dir)."""
+    tmpdir = tempfile.mkdtemp()
+    repo_dir = os.path.join(tmpdir, "repo")
+    os.makedirs(repo_dir)
+
+    # Init repo
+    subprocess.run(["git", "init", repo_dir], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo_dir, "config", "user.email", "test@test.com"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Test"], check=True)
+
+    # Initial commit
+    test_file = os.path.join(repo_dir, "test.txt")
+    with open(test_file, "w") as f:
+        f.write("original\n")
+    subprocess.run(["git", "-C", repo_dir, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "init"], check=True, capture_output=True)
+
+    # Create worktree
+    wt_dir = os.path.join(tmpdir, "worktrees", "test-task")
+    os.makedirs(os.path.dirname(wt_dir), exist_ok=True)
+    subprocess.run(["git", "-C", repo_dir, "worktree", "add", wt_dir, "-b", "rapper/test-task"],
+                   check=True, capture_output=True)
+
+    return repo_dir, wt_dir
+
+
+def test_auto_commit_worktree_commits_changes():
+    """Test that auto_commit_worktree commits uncommitted changes in a worktree."""
+    repo_dir, wt_dir = _make_test_git_repo()
+
+    try:
+        # Modify a file in the worktree (simulating what Claude does)
+        test_file = os.path.join(wt_dir, "test.txt")
+        with open(test_file, "w") as f:
+            f.write("modified by claude\n")
+
+        # Verify uncommitted changes exist
+        result = subprocess.run(["git", "-C", wt_dir, "status", "--porcelain"],
+                                capture_output=True, text=True)
+        assert result.stdout.strip(), "Should have uncommitted changes before auto_commit"
+
+        # Verify only init commit exists
+        result = subprocess.run(["git", "-C", wt_dir, "rev-list", "--count", "HEAD"],
+                                capture_output=True, text=True)
+        assert result.stdout.strip() == "1", "Should have only 1 commit before auto_commit"
+
+        # Create a mock Task
+        task = Task(
+            id="test-123",
+            name="test-task",
+            prompt="test",
+            workdir=wt_dir,
+            worktree_path=wt_dir,
+            branch_name="rapper/test-task",
+        )
+
+        # Run auto_commit_worktree
+        success = auto_commit_worktree(task)
+        assert success, "auto_commit_worktree should return True on success"
+
+        # Verify the worktree is now clean
+        result = subprocess.run(["git", "-C", wt_dir, "status", "--porcelain"],
+                                capture_output=True, text=True)
+        assert not result.stdout.strip(), "Worktree should be clean after auto_commit"
+
+        # Verify a new commit was created
+        result = subprocess.run(["git", "-C", wt_dir, "rev-list", "--count", "HEAD"],
+                                capture_output=True, text=True)
+        assert result.stdout.strip() == "2", "Should have 2 commits after auto_commit"
+
+        # Verify commit message contains task name
+        result = subprocess.run(["git", "-C", wt_dir, "log", "-1", "--format=%s"],
+                                capture_output=True, text=True)
+        assert "test-task" in result.stdout, f"Commit msg should mention task name: {result.stdout}"
+
+        print("✓ test_auto_commit_worktree_commits_changes passed")
+    finally:
+        import shutil
+        shutil.rmtree(os.path.dirname(os.path.dirname(wt_dir)), ignore_errors=True)
+
+
+def test_auto_commit_worktree_clean_is_noop():
+    """Test that auto_commit_worktree returns True (success) on a clean worktree."""
+    repo_dir, wt_dir = _make_test_git_repo()
+
+    try:
+        # No changes — worktree should be clean
+        task = Task(
+            id="test-456",
+            name="test-clean",
+            prompt="test",
+            workdir=wt_dir,
+            worktree_path=wt_dir,
+            branch_name="rapper/test-task",
+        )
+
+        success = auto_commit_worktree(task)
+        assert success, "auto_commit_worktree on clean worktree should return True"
+
+        # Should still have only 1 commit
+        result = subprocess.run(["git", "-C", wt_dir, "rev-list", "--count", "HEAD"],
+                                capture_output=True, text=True)
+        assert result.stdout.strip() == "1", "Should still have 1 commit (no new commit made)"
+
+        print("✓ test_auto_commit_worktree_clean_is_noop passed")
+    finally:
+        import shutil
+        shutil.rmtree(os.path.dirname(os.path.dirname(wt_dir)), ignore_errors=True)
+
+
+def test_auto_commit_worktree_invalid_path():
+    """Test that auto_commit_worktree returns False for invalid/missing worktree path."""
+    task = Task(
+        id="test-789",
+        name="test-invalid",
+        prompt="test",
+        workdir="/nonexistent/path",
+        worktree_path="/nonexistent/path",
+        branch_name="rapper/test-invalid",
+    )
+
+    success = auto_commit_worktree(task)
+    assert not success, "auto_commit_worktree on invalid path should return False"
+    print("✓ test_auto_commit_worktree_invalid_path passed")
+
+
 if __name__ == "__main__":
     """Run all tests."""
     print("Running worktree isolation tests...\n")
@@ -205,6 +335,9 @@ if __name__ == "__main__":
         test_guard_contains_worktree_path()
         test_complex_replacement_scenario()
         test_repo_workdir_with_trailing_slash()
+        test_auto_commit_worktree_commits_changes()
+        test_auto_commit_worktree_clean_is_noop()
+        test_auto_commit_worktree_invalid_path()
 
         print("\n🎉 All worktree isolation tests passed!")
 

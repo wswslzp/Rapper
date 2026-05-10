@@ -82,13 +82,14 @@ rapper --attach <name>          # Attach to existing session
 rapper --list                   # List Rapper sessions
 
 # Background tasks (autonomous, non-blocking)
-rapper --background <name> -p "task" -w /project          # Start background task
-rapper --background <name> --worktree -p "task" -w /proj  # Isolated git worktree
+rapper --background <name> -p "task" --workdir /project          # Start background task
+rapper --background <name> --worktree -p "task" --workdir /proj  # Isolated git worktree
 rapper --background <name> -p "task" --budget 1.5 --fallback claude-haiku-3  # With cost cap
 rapper --background <name> -p "task" --max-turns 100      # Custom max turns (default: 200)
 rapper --tasks [status]                # List tasks (optionally filter by status)
 rapper --task-count                    # Running task count (for concurrency check)
-rapper --status <task_id>             # Get task status + structured result
+rapper --task-count-json               # Detailed task count + concurrency info in JSON (for Hermes)
+rapper --status <task_id>             # Get task status + enhanced structured result
 rapper --logs <task_id> [lines]       # View task logs (default: 50 lines)
 rapper --cancel <task_id>             # Cancel running task
 rapper --merge <task_id>              # Auto-commit + merge worktree branch + cleanup
@@ -109,7 +110,7 @@ rapper --update-claude          # Update Claude Code to latest version
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-p "prompt"` | Task description (required) | — |
-| `-w / --workdir <path>` | Working directory for Claude | `$(pwd)` |
+| `--workdir <path>` | Working directory for Claude | `$(pwd)` |
 | `--worktree` | Create isolated git worktree | false |
 | `--budget <usd>` | Max spend in USD (`--max-budget-usd`) | none |
 | `--fallback <model>` | Fallback model on overload | none |
@@ -126,7 +127,7 @@ The `Task` dataclass persists full execution state to `~/.rapper/tasks/<id>.json
 | `status` | str | `pending → running → completed\|failed\|cancelled` |
 | `pid` | int | Claude subprocess PID |
 | `result` | str | Final output text |
-| `structured_result` | dict | Parsed JSON result `{status, output_path, pr_url, errors}` |
+| `structured_result` | dict | **Enhanced** parsed JSON result `{status, output_path, pr_url, errors}` with fallback inference |
 | `error` | str | Error message if failed |
 | `fail_reason` | str | `error_max_turns \| error_budget \| (other)` |
 | `session_id` | str | Claude session ID (for `--resume` continuation) |
@@ -136,6 +137,7 @@ The `Task` dataclass persists full execution state to `~/.rapper/tasks/<id>.json
 | `branch_name` | str | Feature branch name (e.g. `rapper/feat-auth`) |
 | `repo_workdir` | str | Main repo path (distinct from worktree in `--worktree` mode) |
 | `claude_version` | str | Claude Code version at task start |
+| `board_task_id` | str | Agent Board task ID (e.g., task_7f25a48f) |
 | `progress` | list[dict] | Last 20 tool calls (rolling) |
 
 Associated files per task:
@@ -269,4 +271,111 @@ python /app/rapper/launch_daemons.py
 
 Each daemon registers itself, polls for `todo` tasks assigned to its `agent_id`, executes them via Claude Code, and updates task status on completion.
 
-See `HERMES_INTEGRATION.md` for full Python integration code examples.
+See `HERMES_INTEGRATION.md` for full Python integration code examples and `HERMES_INTEGRATION_EXAMPLES.md` for detailed usage examples of enhanced features.
+
+## Agent Skills
+
+Skills are loaded automatically from `~/.claude/skills/` (global) and `.claude/skills/` (project).
+Before starting any non-trivial task, scan the relevant skills and follow their instructions.
+
+### Development Workflow (obra/superpowers)
+Design docs and plans live in `docs/superpowers/`. Always follow this sequence:
+**Brainstorm → Design Doc → Plan → TDD Implementation → Code Review → Finish**
+
+| Phase | Location |
+|-------|----------|
+| Specs | `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` |
+| Plans | `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` |
+
+### Available Global Skills (`~/.claude/skills/`)
+
+| Skill | When to use |
+|-------|-------------|
+| `diagnose` | Bug/regression: reproduce → minimise → hypothesise → fix |
+| `tdd` | New feature or bugfix: red-green-refactor TDD loop |
+| `grill-me` | Stress-test a plan — agent interviews you until shared understanding |
+| `grill-with-docs` | Align plan with domain model, update CONTEXT.md + ADRs |
+| `zoom-out` | Need broader context / higher-level view of the codebase |
+| `improve-codebase-architecture` | Architecture health check, refactor opportunities |
+| `triage` | Issue triage state machine (create / review / prepare for agent) |
+| `to-issues` | Break a plan/spec/PRD into independently-grabbable GitHub issues |
+| `to-prd` | Turn conversation context into a PRD on the issue tracker |
+| `caveman` | 75% token reduction mode — ultra-compressed output |
+| `write-a-skill` | Create a new SKILL.md with proper structure |
+
+## Enhanced Hermes Integration
+
+### Structured Result Reporting
+
+Rapper now provides enhanced structured result parsing and reporting for better Hermes integration:
+
+#### Features
+- **Robust JSON parsing**: Handles multiple formats and provides fallback inference
+- **Enhanced Claude guidance**: Clear, emphasized prompts ensure proper structured output
+- **Machine-readable status**: `--status` includes `HERMES_INTEGRATION_JSON` line for programmatic access
+- **Automatic fallback**: If explicit JSON isn't found, system infers results from text patterns
+
+#### Structured Result Format
+```json
+{
+  "status": "completed|failed|partial",
+  "output_path": "relative/path/to/main/file",
+  "pr_url": "https://github.com/user/repo/pull/123",
+  "errors": ["error message if any"]
+}
+```
+
+### Concurrency Control
+
+Enhanced concurrent task management for multi-Rapper scenarios:
+
+#### New Commands
+- `rapper --task-count-json`: Detailed concurrency info in JSON format
+- Enhanced `--task-count`: Backward-compatible simple count
+
+#### Python Integration (`lib/hermes_integration.py`)
+```python
+from lib.hermes_integration import RapperTaskManager
+
+manager = RapperTaskManager()
+
+# Check capacity
+if manager.can_start_task():
+    task_id = manager.start_task("task-name", "prompt", workdir="/app/project")
+
+# Wait for slot availability
+if manager.wait_for_slot(max_wait=300):
+    # Slot available, start task
+
+# Monitor completion
+result = manager.wait_for_completion(task_id, timeout=3600)
+```
+
+#### Concurrency JSON Format
+```json
+{
+  "timestamp": 1778161033,
+  "concurrency": {
+    "running": 4,
+    "max_concurrent": 5,
+    "at_capacity": false,
+    "available_slots": 1
+  },
+  "task_counts": {
+    "pending": 0,
+    "running": 4,
+    "completed": 189,
+    "failed": 48,
+    "cancelled": 6,
+    "total": 247
+  }
+}
+```
+
+### Configuration
+
+Set maximum concurrent tasks in `~/.rapper/config.yaml`:
+```yaml
+tasks:
+  max_concurrent_tasks: 5  # Adjust based on resource limits
+```

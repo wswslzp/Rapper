@@ -90,23 +90,24 @@ Rapper 目前是**临时工模式（Ephemeral）**：由 Hermes 通过 `delegate
 > **发现时间**：2026-04-29
 > **触发场景**：用 `rapper --background` 启动多轮 wiki 构建任务时，monitor cron 自动续启的 r2 任务 workdir 全部错误（落在 `/app/rapper`、`/app/agent-board` 等），而不是目标 vault 目录 `/data/zhihu/articles/dabinge`，导致大多数轮次找不到文件、白跑无效。
 
-**根本原因：**
+**状态：✅ 已解决** (2026-05-07)
 
-1. **`--background` 不接受 `--workdir` 参数**：`rapper --background <name> -p "..."` 目前只接受 `-p` 和 `-w`（`-w` 是 git worktree，不是 workdir），无法在命令行层面绑定工作目录。
-2. **workdir 继承自调用方**：后台任务的 workdir 取决于谁调用了 rapper，而 cron job 的调用方是 Hermes scheduler，其 cwd 与目标项目无关。
-3. **Claude Code 内部的 `cd` 与 prompt 上下文割裂**：即使 prompt 里写了路径，Claude Code 启动时仍从 scheduler cwd 出发，若 prompt 没有足够明确地反复强调绝对路径，子任务很容易漂移。
+**根本原因分析（已修复）：**
 
-**期望行为：**
+1. ~~**`--background` 不接受 `--workdir` 参数**~~：**实际上已支持**，`rapper --background <name> --workdir /path -p "..."` 功能完整实现并工作正常。
+2. **workdir 继承问题**：当未显式指定 `--workdir` 时，后台任务确实继承调用方的 cwd，但可通过 `--workdir` 参数明确指定。
+3. **文档错误**：帮助文本中错误显示 `-w /project`，实际应为 `--workdir /project`。
 
-- `rapper --background <name> --workdir /abs/path -p "..."` 能绑定 workdir，启动的 Claude Code 进程以该目录为 cwd。
-- 任务 status JSON（`~/.rapper/tasks/<id>.json`）中记录实际使用的 workdir，方便调试。
+**已实现功能：**
 
-**需要修改的地方：**
+- ✅ `rapper --background <name> --workdir /abs/path -p "..."` 完全支持，已测试工作正常。
+- ✅ 任务 status JSON 已包含 `"workdir_effective": actual_cwd` 字段。
+- ✅ `task_runner.py` 已在 double-fork 中执行 `os.chdir(workdir)`。
 
-- `rapper`（主脚本）：`do_background()` 函数解析新增的 `--workdir` 参数，传给 `_run_task_sync()`。
-- `lib/task_runner.py`：`_run_task_sync()` / `start_background_task()` 接受 `workdir` 参数，`os.chdir(workdir)` 在 double-fork 的 grandchild 中执行（目前只 hardcode 了 `os.chdir(workdir)` 但 workdir 来源不明确，需确认）。
-- `lib/task_runner.py`：status JSON 写入时补充 `"workdir_effective": actual_cwd` 字段。
-- **文档**：在 SKILL.md（`claude-background-tasks`）和 README 中补充 `--workdir` 用法示例。
+**已修复的文档错误：**
+
+- ✅ 修复帮助文本中的 `-w` 错误，改为正确的 `--workdir`。
+- ✅ 更新 TODO.md 中的误导性描述。
 
 **临时规避方案（已验证可用）：**
 
@@ -129,12 +130,12 @@ Rapper 目前是**临时工模式（Ephemeral）**：由 Hermes 通过 `delegate
 
 ```bash
 # 在 worktree 模式启动后台任务（自动创建 branch + worktree）
-rapper --background feature-auth --worktree -p "实现 JWT 认证模块" -w /app/myproject
+rapper --background feature-auth --worktree -p "实现 JWT 认证模块" --workdir /app/myproject
 
 # 多个 Rapper 并行，各自在独立 branch
-rapper --background feat-auth   --worktree -p "实现认证" -w /app/myproject
-rapper --background feat-search --worktree -p "实现搜索" -w /app/myproject
-rapper --background feat-cache  --worktree -p "实现缓存" -w /app/myproject
+rapper --background feat-auth   --worktree -p "实现认证" --workdir /app/myproject
+rapper --background feat-search --worktree -p "实现搜索" --workdir /app/myproject
+rapper --background feat-cache  --worktree -p "实现缓存" --workdir /app/myproject
 
 # 查看各任务的 branch/worktree 信息
 rapper --status <task-id>   # 输出中显示 branch 和 worktree 路径
