@@ -597,7 +597,7 @@ class RapperDaemon:
 
     def _heartbeat_worker(self, task_id: str, stop_event: threading.Event):
         """Background worker to send periodic heartbeat updates for a task."""
-        heartbeat_interval = 60  # Send heartbeat every 60 seconds
+        heartbeat_interval = 30  # Send heartbeat every 30 seconds
 
         while not stop_event.is_set():
             if stop_event.wait(heartbeat_interval):
