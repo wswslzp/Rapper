@@ -181,6 +181,12 @@ def load_config() -> dict:
         },
         "agent_board": {
             "api_key": ""
+        },
+        "board_tools": {
+            "enabled": True,
+            "api_url": "http://localhost:3456",
+            "api_key": "sk-4429c0b2e53522a890b1c5ab6c0d1fcb",
+            "agent_id": "rapper-1"
         }
     }
 
@@ -197,6 +203,8 @@ def load_config() -> dict:
             result["progress_reporting"].update(config["progress_reporting"])
         if "agent_board" in config:
             result["agent_board"].update(config["agent_board"])
+        if "board_tools" in config:
+            result["board_tools"].update(config["board_tools"])
 
         return result
     except Exception:
@@ -385,46 +393,215 @@ def _make_worktree_safe_prompt(prompt: str, repo_workdir: str, worktree_path: st
     return guard + safe_prompt
 
 
+def _get_board_tools_instructions() -> str:
+    """Generate board tools instructions if enabled."""
+    try:
+        # Check if board tools are enabled
+        config = load_config()
+        board_config = config.get("board_tools", {})
+
+        if not board_config.get("enabled", True):
+            return ""
+
+        rapper_dir = os.environ.get("RAPPER_DIR", "/app/rapper")
+
+        board_instructions = f"""
+
+AGENT BOARD TOOLS: You have access to native Agent Board integration via Python.
+Import and use these functions to interact with the Kanban board:
+
+```python
+import sys
+sys.path.append('{rapper_dir}/lib')
+from board_tools import board_move_task, board_add_comment, board_get_task, board_my_tasks
+
+# Move a task to different column
+result = board_move_task("task_abc123", "doing")
+print(result)
+
+# Add comment to task
+result = board_add_comment("task_abc123", "Started working on this")
+print(result)
+
+# Get task details
+result = board_get_task("task_abc123")
+print(result)
+
+# List my assigned tasks
+result = board_my_tasks("todo", 5)
+print(result)
+```
+
+Functions available:
+- **board_move_task(task_id, column)**: Move task to 'todo', 'doing', 'done', 'failed', etc.
+- **board_add_comment(task_id, comment, author=None)**: Add comment to task
+- **board_get_task(task_id)**: Get detailed task information
+- **board_my_tasks(status=None, limit=10)**: List assigned tasks (filter by status, limit results)
+
+API endpoint: {board_config.get('api_url', 'http://localhost:3456')}
+Agent ID: {board_config.get('agent_id', 'rapper-1')}"""
+
+        return board_instructions
+
+    except Exception:
+        # Silent failure - don't break task execution if board tools aren't available
+        return ""
+
+
 def _parse_structured_result(result_text: str) -> dict | None:
     """Parse structured result JSON from Claude's text output.
 
-    Looks for JSON blocks in the format:
-    ```json
-    {"structured_result": {...}}
-    ```
-
-    Returns the structured_result dict if found, None otherwise.
+    Looks for JSON blocks in multiple formats and attempts to extract or infer
+    the structured result. Returns a dict with status, output_path, pr_url, errors.
     """
     import re
 
     if not result_text:
         return None
 
-    # Look for JSON code blocks
-    json_pattern = r'```json\s*(\{[^`]+\})\s*```'
+    # Pattern 1: Look for JSON code blocks with structured_result wrapper
+    json_pattern = r'```json\s*(\{[^`]*\})\s*```'
     matches = re.findall(json_pattern, result_text, re.DOTALL | re.IGNORECASE)
 
     for match in matches:
         try:
             parsed = json.loads(match)
-            if isinstance(parsed, dict) and "structured_result" in parsed:
-                return parsed["structured_result"]
+            if isinstance(parsed, dict):
+                # If it has structured_result key, return that
+                if "structured_result" in parsed:
+                    return parsed["structured_result"]
+
+                # If it looks like a structured result itself (has status), use it directly
+                if "status" in parsed:
+                    return parsed
+
         except json.JSONDecodeError:
             continue
 
-    # Also try to find standalone JSON at end of text
+    # Pattern 2: Look for standalone JSON objects at the end
     lines = result_text.strip().split('\n')
-    for i in range(len(lines) - 1, max(len(lines) - 10, 0) - 1, -1):
+    for i in range(len(lines) - 1, max(len(lines) - 15, 0) - 1, -1):
         line = lines[i].strip()
         if line.startswith('{') and line.endswith('}'):
             try:
                 parsed = json.loads(line)
-                if isinstance(parsed, dict) and "structured_result" in parsed:
-                    return parsed["structured_result"]
+                if isinstance(parsed, dict):
+                    # Check if it's a structured result wrapper or direct result
+                    if "structured_result" in parsed:
+                        return parsed["structured_result"]
+                    elif "status" in parsed:
+                        return parsed
             except json.JSONDecodeError:
                 continue
 
-    return None
+    # Pattern 3: Look for any JSON-like object with key indicators throughout text
+    json_objects = re.finditer(r'\{[^{}]*(?:"status"|"output_path"|"pr_url")[^{}]*\}', result_text)
+    for match in json_objects:
+        try:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, dict) and ("status" in parsed or "output_path" in parsed):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+
+    # Fallback: Create structured result from text analysis
+    return _infer_structured_result(result_text)
+
+
+def _infer_structured_result(result_text: str) -> dict:
+    """Infer structured result from task output text when explicit JSON is not found.
+
+    Analyzes the text for success/failure indicators and common patterns
+    to create a basic structured result.
+    """
+    import re
+
+    result = {
+        "status": "unknown",
+        "output_path": None,
+        "pr_url": None,
+        "errors": []
+    }
+
+    if not result_text:
+        result["status"] = "failed"
+        result["errors"] = ["No output generated"]
+        return result
+
+    text_lower = result_text.lower()
+
+    # Detect status based on common indicators
+    success_indicators = [
+        "task completed", "successfully completed", "implementation complete",
+        "done", "finished successfully", "task is complete", "✅", "✓",
+        "all tests pass", "implementation successful"
+    ]
+
+    failure_indicators = [
+        "error", "failed", "exception", "❌", "✗", "could not", "unable to",
+        "failed to", "error occurred", "something went wrong"
+    ]
+
+    # Check for success indicators
+    if any(indicator in text_lower for indicator in success_indicators):
+        result["status"] = "completed"
+
+    # Check for failure indicators (overrides success if found)
+    if any(indicator in text_lower for indicator in failure_indicators):
+        result["status"] = "failed"
+        # Extract error messages
+        error_lines = []
+        for line in result_text.split('\n'):
+            line_lower = line.lower()
+            if any(indicator in line_lower for indicator in ["error:", "failed:", "exception:"]):
+                error_lines.append(line.strip())
+        if error_lines:
+            result["errors"] = error_lines
+
+    # If no clear indicators, assume partial completion
+    if result["status"] == "unknown":
+        result["status"] = "partial"
+
+    # Try to detect output paths
+    path_patterns = [
+        r'(?:created?|wrote|generated?|saved?|modified?)\s+[`\'"]?([^\s`\'"]+\.[a-zA-Z]{1,4})[`\'"]?',
+        r'(?:file|path|output):\s*[`\'"]?([^\s`\'"]+)[`\'"]?',
+        r'[`\'"]([^\s`\'"]*\.[a-zA-Z]{2,4})[`\'"]',  # Generic file paths in quotes
+    ]
+
+    for pattern in path_patterns:
+        matches = re.findall(pattern, result_text, re.IGNORECASE)
+        if matches:
+            # Filter out obviously non-path matches and take the first reasonable one
+            for match in matches:
+                if len(match) > 3 and ('/' in match or '\\' in match or '.' in match):
+                    # Convert absolute paths to relative if they're under the workdir
+                    if match.startswith('/'):
+                        # Try to make it relative (basic heuristic)
+                        path_parts = match.split('/')
+                        if len(path_parts) > 2:
+                            result["output_path"] = '/'.join(path_parts[-2:])  # last 2 parts
+                        else:
+                            result["output_path"] = match
+                    else:
+                        result["output_path"] = match
+                    break
+        if result["output_path"]:
+            break
+
+    # Try to detect PR URLs
+    pr_patterns = [
+        r'(?:pull request|PR|pr).*?(https://github\.com/[^\s]+)',
+        r'(https://github\.com/[^\s]+/pull/\d+)',
+    ]
+
+    for pattern in pr_patterns:
+        matches = re.findall(pattern, result_text, re.IGNORECASE)
+        if matches:
+            result["pr_url"] = matches[0]
+            break
+
+    return result
 
 
 def _add_structured_result_instructions(prompt: str, task_id: str | None = None) -> str:
@@ -435,19 +612,27 @@ def _add_structured_result_instructions(prompt: str, task_id: str | None = None)
     """
     structured_instructions = """
 
-IMPORTANT: When you complete this task, include a structured result at the end of your response in the following JSON format:
+🔥 CRITICAL: STRUCTURED RESULT REQUIRED 🔥
+
+When you complete this task, you MUST include a structured result at the end of your response.
+Use EXACTLY this JSON format (copy and paste the template):
 
 ```json
-{"structured_result": {"status": "completed", "output_path": "path/to/artifact", "pr_url": null, "errors": []}}
+{"status": "completed", "output_path": "relative/path/to/main/file", "pr_url": null, "errors": []}
 ```
 
-The structured_result should contain:
-- status: "completed", "failed", or "partial"
-- output_path: relative path to main artifact/file created/modified (if any)
-- pr_url: GitHub pull request URL if one was created (null otherwise)
-- errors: array of error messages (if any)
+Required fields:
+- status: MUST be "completed", "failed", or "partial"
+- output_path: relative path to the primary file you created/modified (use null if none)
+- pr_url: GitHub PR URL if you created one (use null otherwise)
+- errors: array of error messages (use [] if none)
 
-This structured result will be parsed automatically for integration with Hermes."""
+Examples:
+✅ Success: {"status": "completed", "output_path": "src/auth.py", "pr_url": null, "errors": []}
+✅ With PR: {"status": "completed", "output_path": "components/Login.tsx", "pr_url": "https://github.com/user/repo/pull/123", "errors": []}
+❌ Failure: {"status": "failed", "output_path": null, "pr_url": null, "errors": ["Could not connect to database"]}
+
+⚠️  This JSON will be parsed automatically - any formatting errors will cause integration failures!"""
 
     if task_id:
         progress_instructions = f"""
@@ -463,7 +648,65 @@ echo "Generated tests, running validation" >> ~/.rapper/tasks/{task_id}.progress
 These progress messages will be monitored by Hermes and can trigger notifications. Use this for major milestones or when tasks will take more than a few minutes."""
         structured_instructions += progress_instructions
 
+    # Add board tools instructions if enabled
+    board_tools_instructions = _get_board_tools_instructions()
+    if board_tools_instructions:
+        structured_instructions += board_tools_instructions
+
     return prompt + structured_instructions
+
+
+def auto_commit_worktree(task: "Task") -> bool:
+    """Auto-commit any uncommitted changes in a worktree after task completes.
+
+    This ensures the branch has a proper commit so `rapper --merge` can merge it.
+    Returns True if a commit was made or the worktree was already clean.
+    Returns False if commit failed.
+    """
+    if not task.worktree_path or not os.path.isdir(task.worktree_path):
+        return False
+
+    try:
+        # Check for uncommitted changes
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=task.worktree_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        dirty = result.stdout.strip()
+        if not dirty:
+            return True  # Already clean, nothing to commit
+
+        # Stage all changes
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=task.worktree_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        # Commit with task metadata
+        task_name = task.name or task.id
+        branch_short = (task.branch_name or "").replace("rapper/", "")
+        commit_msg = f"feat({branch_short}): task '{task_name}' completed by rapper"
+        subprocess.run(
+            ["git", "commit", "-m", commit_msg],
+            cwd=task.worktree_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return True
+
+    except subprocess.CalledProcessError:
+        return False
+    except Exception:
+        return False
 
 
 def remove_worktree(worktree_path: str, workdir: str) -> bool:
@@ -652,6 +895,11 @@ class TaskRunner:
         env["RAPPER_SCHEDULED"] = "1"  # Activate outbound guard
         env["RAPPER_TASK_ID"] = task_id
         env["RAPPER_DIR"] = self.rapper_dir
+        # Pass workdir so bash-runner MCP (launched by claude) uses it as default CWD.
+        # The bash-runner server always starts in /app/rapper (via uv --directory), so
+        # os.getcwd() inside it is always /app/rapper regardless of Popen(cwd=...).
+        # Setting RAPPER_WORKDIR lets it resolve the correct task working directory.
+        env["RAPPER_WORKDIR"] = workdir
         
         # Start process
         log_file = open(task.log_file, "w")
@@ -799,6 +1047,9 @@ class TaskRunner:
                     # Parse structured result from the text output
                     full_text = "\n".join(text_parts)
                     task.structured_result = _parse_structured_result(task.result or full_text)
+                    # Auto-commit worktree changes so branch has a proper commit for --merge
+                    if task.worktree_path:
+                        auto_commit_worktree(task)
                 else:
                     task.status = "failed"
                     task.error = task.error or f"Exit code {proc.returncode}"
@@ -910,6 +1161,8 @@ class TaskRunner:
         env["RAPPER_SCHEDULED"] = "1"
         env["RAPPER_TASK_ID"] = task.id
         env["RAPPER_DIR"] = self.rapper_dir
+        # Pass workdir so bash-runner MCP (launched by claude) uses it as default CWD.
+        env["RAPPER_WORKDIR"] = task.workdir
         
         # Open log file
         log_file = open(task.log_file, "w")
@@ -1031,6 +1284,9 @@ class TaskRunner:
                     # Parse structured result from the text output
                     full_text = "\n".join(text_parts)
                     task.structured_result = _parse_structured_result(task.result or full_text)
+                    # Auto-commit worktree changes so branch has a proper commit for --merge
+                    if task.worktree_path:
+                        auto_commit_worktree(task)
                 else:
                     task.status = "failed"
                     task.error = task.error or f"Exit code {proc.returncode}"
@@ -1203,13 +1459,27 @@ def main():
             print(f"Session: {task.session_id}  # use with: claude -p '...' --resume <session_id>")
         if task.structured_result:
             print(f"\nStructured Result:")
-            print(f"  Status: {task.structured_result.get('status', 'unknown')}")
-            if task.structured_result.get('output_path'):
-                print(f"  Output: {task.structured_result['output_path']}")
-            if task.structured_result.get('pr_url'):
-                print(f"  PR URL: {task.structured_result['pr_url']}")
-            if task.structured_result.get('errors'):
-                print(f"  Errors: {task.structured_result['errors']}")
+            print(f"  Status:      {task.structured_result.get('status', 'unknown')}")
+            print(f"  Output Path: {task.structured_result.get('output_path') or '(none)'}")
+            print(f"  PR URL:      {task.structured_result.get('pr_url') or '(none)'}")
+            print(f"  Errors:      {task.structured_result.get('errors') or []}")
+        else:
+            print(f"\nStructured Result: Not available (task may have completed before structured result parsing was implemented)")
+
+        # For Hermes integration, also output a machine-readable JSON line
+        if task.status in ["completed", "failed"]:
+            import json
+            hermes_result = {
+                "task_id": task.id,
+                "status": task.status,
+                "structured_result": task.structured_result or {
+                    "status": task.status,
+                    "output_path": None,
+                    "pr_url": None,
+                    "errors": [task.error] if task.error else []
+                }
+            }
+            print(f"\n# HERMES_INTEGRATION_JSON: {json.dumps(hermes_result)}")
         if task.result:
             print(f"\nResult:\n{task.result[:1000]}")
         if task.progress:

@@ -259,7 +259,10 @@ async def run_bash(
         return broad_error
     
     # Resolve working directory
-    cwd = workdir or os.getcwd()
+    # Use RAPPER_WORKDIR env var if set (injected by task_runner for --background tasks),
+    # otherwise fall back to os.getcwd().  This ensures bash commands run in the task's
+    # specified --workdir rather than the bash-runner server's own CWD (/app/rapper).
+    cwd = workdir or os.environ.get("RAPPER_WORKDIR") or os.getcwd()
     if not os.path.isdir(cwd):
         return f"Error: working directory does not exist: {cwd}"
     
