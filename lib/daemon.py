@@ -268,6 +268,9 @@ class RapperDaemon:
         # Deduplication file path
         self.picked_tasks_file = os.path.expanduser("~/.rapper/daemon_picked.json")
 
+        # Poll error backoff counter
+        self._poll_error_count = 0
+
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from YAML file."""
         with open(self.config_path, 'r') as f:
@@ -431,6 +434,7 @@ class RapperDaemon:
         """Poll for tasks and execute them."""
         try:
             tasks = self.client.get_tasks(self.agent_id, 'todo')
+            self._poll_error_count = 0  # reset on successful poll
 
             if not tasks:
                 self.logger.debug("No tasks found")
@@ -542,7 +546,8 @@ class RapperDaemon:
                 self.current_task = None
 
         except Exception as e:
-            self.logger.error(f"Error in task polling: {e}")
+            self._poll_error_count += 1
+            self.logger.error(f'Error in task polling (attempt {self._poll_error_count}): {e}')
 
     def _heartbeat_worker(self, task_id: str, stop_event: threading.Event):
         """Background worker to send periodic heartbeat updates for a task."""
@@ -565,14 +570,57 @@ class RapperDaemon:
         return self.client._make_request(method, endpoint, data)
 
     def _count_running_tasks(self) -> int:
-        """Count currently running tasks across all agents."""
-        from task_runner import list_tasks
+        """Count running tasks — only check recent files to avoid scanning 400+ historical task files."""
+        import glob as _glob
+        import time as _time
         try:
-            running_tasks = list_tasks(status="running", limit=100)
-            return len(running_tasks)
+            tasks_dir = os.path.expanduser('~/.rapper/tasks')
+            cutoff = _time.time() - 86400  # only look at files from last 24h
+            count = 0
+            for f in _glob.glob(os.path.join(tasks_dir, '*.json')):
+                try:
+                    if os.path.getmtime(f) < cutoff:
+                        continue
+                    with open(f) as fp:
+                        d = json.load(fp)
+                    if d.get('status') == 'running':
+                        count += 1
+                except Exception:
+                    continue
+            return count
         except Exception as e:
-            self.logger.error(f"Error counting running tasks: {e}")
+            self.logger.error(f'Error counting running tasks: {e}')
             return 0
+
+    def _archive_old_task_files(self, max_age_days: int = 7):
+        """Move completed/failed task files older than max_age_days to archive dir."""
+        import glob as _glob
+        import shutil as _shutil
+        import time as _time
+        tasks_dir = os.path.expanduser('~/.rapper/tasks')
+        archive_dir = os.path.join(tasks_dir, 'archive')
+        os.makedirs(archive_dir, exist_ok=True)
+        cutoff = _time.time() - (max_age_days * 86400)
+        archived = 0
+        for f in _glob.glob(os.path.join(tasks_dir, '*.json')):
+            try:
+                if os.path.getmtime(f) > cutoff:
+                    continue
+                with open(f) as fp:
+                    d = json.load(fp)
+                if d.get('status') not in ('completed', 'failed', 'cancelled'):
+                    continue
+                # Move json + associated files (.log, .audit.json, .progress)
+                base = f[:-5]  # strip .json
+                for ext in ['.json', '.log', '.audit.json', '.progress']:
+                    src = base + ext
+                    if os.path.exists(src):
+                        _shutil.move(src, archive_dir)
+                archived += 1
+            except Exception:
+                continue
+        if archived > 0:
+            self.logger.info(f'Archived {archived} old task files to {archive_dir}')
 
     def _handle_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -602,6 +650,9 @@ class RapperDaemon:
 
         # Clear old picked tasks (fresh start)
         self._clear_old_picked_tasks()
+
+        # Archive old task files to keep tasks dir lean
+        self._archive_old_task_files()
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_shutdown)
