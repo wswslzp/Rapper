@@ -128,6 +128,43 @@ class AgentBoardClient:
         except (HTTPError, URLError, json.JSONDecodeError):
             return []
 
+    def claim_task(self, task_id: str, agent_id: str, retries: int = 3) -> bool:
+        """Atomically claim a task by moving it to 'doing' column.
+
+        This is the core of Method A: claim BEFORE execution so the task
+        is no longer visible in todo on the next poll, even if execution
+        crashes or the daemon restarts.
+
+        Args:
+            task_id: Board task ID to claim.
+            agent_id: Agent ID (used for the initial comment).
+            retries: Number of retry attempts on transient errors.
+
+        Returns:
+            True if task was successfully moved to 'doing', False otherwise.
+        """
+        payload = {
+            'column': 'doing',
+            'lastHeartbeat': datetime.utcnow().isoformat() + 'Z',
+        }
+        for attempt in range(1, retries + 1):
+            try:
+                self._make_request('PATCH', f'/api/tasks/{task_id}', payload)
+                # Leave a breadcrumb comment so the audit trail shows who claimed it
+                try:
+                    self._make_request('POST', f'/api/tasks/{task_id}/comments',
+                                       {'author': agent_id, 'text': 'Started by agent ' + agent_id})
+                except Exception:
+                    pass  # comment failure is non-fatal
+                return True
+            except (HTTPError, URLError, json.JSONDecodeError) as e:
+                self.logger.warning(
+                    f"claim_task attempt {attempt}/{retries} failed for {task_id}: {e}"
+                )
+                if attempt < retries:
+                    time.sleep(1)
+        return False
+
     def update_task_status(self, task_id: str, status: str, comment: Optional[str] = None,
                            author: Optional[str] = None) -> bool:
         """Update task status on Agent Board."""
@@ -147,6 +184,17 @@ class AgentBoardClient:
                                    {'author': author, 'text': comment})
             return True
         except (HTTPError, URLError, json.JSONDecodeError):
+            return False
+
+    def update_task_heartbeat(self, task_id: str) -> bool:
+        """Update task heartbeat timestamp on Agent Board."""
+        try:
+            self._make_request('PATCH', f'/api/tasks/{task_id}', {
+                'lastHeartbeat': datetime.utcnow().isoformat() + 'Z'
+            })
+            return True
+        except (HTTPError, URLError, json.JSONDecodeError) as e:
+            self.logger.debug(f"Failed to update heartbeat for task {task_id}: {e}")
             return False
 
 
@@ -318,6 +366,9 @@ class RapperDaemon:
                 return WebhookHandler(self, *args, **kwargs)
 
             self.webhook_server = HTTPServer(('0.0.0.0', port), handler_factory)
+            # Allow address reuse to prevent "Address already in use" errors during rapid restarts
+            self.webhook_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
             self.webhook_thread = threading.Thread(
                 target=self.webhook_server.serve_forever,
                 daemon=True
@@ -385,10 +436,24 @@ class RapperDaemon:
                 self.logger.debug("No tasks found")
                 return
 
-            # Load picked tasks for deduplication (Solution B)
+            # Load picked tasks for deduplication (Solution B — file-based)
             picked_tasks = self._load_picked_tasks()
 
-            # Filter out already picked tasks
+            # Solution A (board-side): Also fetch tasks already in 'doing' for this agent.
+            # This survives daemon restarts: if a prior run claimed a task but the daemon
+            # crashed before finishing, the task stays in 'doing' and we must NOT re-pick it.
+            try:
+                doing_tasks = self.client.get_tasks(self.agent_id, 'doing')
+                for t in doing_tasks:
+                    picked_tasks.add(t['id'])
+                if doing_tasks:
+                    self.logger.debug(
+                        f"Excluding {len(doing_tasks)} already-doing task(s) from consideration"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Could not fetch doing tasks for deduplication: {e}")
+
+            # Filter out already picked / already-doing tasks
             available_tasks = [task for task in tasks if task['id'] not in picked_tasks]
 
             if not available_tasks:
@@ -409,22 +474,32 @@ class RapperDaemon:
 
             self.logger.info(f"Picked task: {task_id} (current load: {running_count}/{max_concurrent})")
 
-            # SOLUTION A & B: Immediately mark as picked and move to doing
-            self._save_picked_task(task_id)
+            # ── Method A: Claim task on the board BEFORE execution ────────────────
+            # Move todo → doing immediately so the next poll never sees it again,
+            # even if this daemon restarts or execution crashes before reporting done.
+            self._save_picked_task(task_id)  # Solution B: file-based dedup (same-process guard)
 
-            # SOLUTION A: Move task to 'doing' status immediately to prevent re-pickup
-            try:
-                self._make_request('PATCH', f'/api/tasks/{task_id}', {'column': 'doing'})
-                self.logger.info(f"Moved task {task_id} to doing column")
-            except Exception as e:
-                self.logger.warning(f"Failed to move task {task_id} to doing: {e}")
+            claimed = self.client.claim_task(task_id, self.agent_id)
+            if claimed:
+                self.logger.info(f"Claimed task {task_id} → doing (pre-execution)")
+            else:
+                # Claim failed (transient network error?). Still proceed: file-based dedup
+                # will prevent re-pickup within this process lifetime, but log a warning
+                # so operators know the board state may be stale.
+                self.logger.warning(
+                    f"Could not claim task {task_id} on board (PATCH todo→doing failed). "
+                    "Proceeding anyway; task may be re-picked after daemon restart if "
+                    "execution does not report done."
+                )
 
             # Create internal task
+            # Use workdir from board task if specified, otherwise use daemon's cwd
+            task_workdir = board_task.get('workdir') or os.getcwd()
             internal_task = Task(
                 id=generate_task_id(),
                 name=board_task.get('title', f"board-{task_id}"),
                 prompt=board_task.get('description', ''),
-                workdir=os.getcwd(),
+                workdir=task_workdir,
                 status='pending',
                 board_task_id=task_id
             )
@@ -432,9 +507,23 @@ class RapperDaemon:
             self.current_task = (task_id, internal_task)
 
             try:
-                # Execute task synchronously
-                self.logger.info(f"Executing task: {internal_task.id}")
-                self.task_runner._run_task_sync(internal_task, timeout=3600, max_turns=200)
+                # Start heartbeat thread to periodically update task status during execution
+                heartbeat_stop_event = threading.Event()
+                heartbeat_thread = threading.Thread(
+                    target=self._heartbeat_worker,
+                    args=(task_id, heartbeat_stop_event),
+                    daemon=True
+                )
+                heartbeat_thread.start()
+
+                try:
+                    # Execute task synchronously
+                    self.logger.info(f"Executing task: {internal_task.id}")
+                    self.task_runner._run_task_sync(internal_task, timeout=3600, max_turns=200)
+                finally:
+                    # Stop heartbeat thread
+                    heartbeat_stop_event.set()
+                    heartbeat_thread.join(timeout=5)
 
                 # Check result
                 if internal_task.status == 'completed':
@@ -454,6 +543,22 @@ class RapperDaemon:
 
         except Exception as e:
             self.logger.error(f"Error in task polling: {e}")
+
+    def _heartbeat_worker(self, task_id: str, stop_event: threading.Event):
+        """Background worker to send periodic heartbeat updates for a task."""
+        heartbeat_interval = 60  # Send heartbeat every 60 seconds
+
+        while not stop_event.is_set():
+            if stop_event.wait(heartbeat_interval):
+                # Stop event was set, exit
+                break
+
+            # Send heartbeat update
+            success = self.client.update_task_heartbeat(task_id)
+            if success:
+                self.logger.debug(f"Heartbeat sent for task {task_id}")
+            else:
+                self.logger.warning(f"Failed to send heartbeat for task {task_id}")
 
     def _make_request(self, method: str, endpoint: str, data: Any = None) -> Dict[str, Any]:
         """Direct API request using daemon's own credentials (bypasses outbound_guard)."""
