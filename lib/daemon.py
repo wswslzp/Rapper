@@ -197,6 +197,17 @@ class AgentBoardClient:
             self.logger.debug(f"Failed to update heartbeat for task {task_id}: {e}")
             return False
 
+    def add_comment(self, task_id: str, author: str, text: str) -> bool:
+        """Post a comment to a Board task."""
+        try:
+            self._make_request('POST', f'/api/tasks/{task_id}/comments',
+                              {'author': author, 'text': text})
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to add comment to {task_id}: {e}")
+            return False
+
+
 
 class WebhookHandler(BaseHTTPRequestHandler):
     """HTTP handler for webhook notifications."""
@@ -264,6 +275,9 @@ class RapperDaemon:
 
         # Current task
         self.current_task = None
+
+        # Progress tracking for current task
+        self._last_progress_step = 0
 
         # Deduplication file path
         self.picked_tasks_file = os.path.expanduser("~/.rapper/daemon_picked.json")
@@ -509,6 +523,7 @@ class RapperDaemon:
             )
 
             self.current_task = (task_id, internal_task)
+            self._last_progress_step = 0  # Reset progress tracking for new task
 
             try:
                 # Start heartbeat thread to periodically update task status during execution
@@ -520,6 +535,7 @@ class RapperDaemon:
                 )
                 heartbeat_thread.start()
 
+                start_time = time.time()  # BUG-P14: record start time for elapsed calculation
                 try:
                     # Execute task synchronously
                     self.logger.info(f"Executing task: {internal_task.id}")
@@ -533,17 +549,47 @@ class RapperDaemon:
                 if internal_task.status == 'completed':
                     self.client.update_task_status(task_id, 'done', internal_task.result or 'Task completed successfully')
                     self.logger.info(f"Task {task_id} completed successfully")
+                    # BUG-P14: Post terminal completion comment
+                    elapsed = int(time.time() - start_time)
+                    steps = len(getattr(internal_task, 'progress', []) or [])
+                    sr = getattr(internal_task, 'structured_result', None) or {}
+                    output_path = sr.get('output_path', '') if isinstance(sr, dict) else ''
+                    text = f"✅ 任务完成\n耗时：{elapsed}s | 步数：{steps}"
+                    if output_path:
+                        text += f"\n输出：{output_path}"
+                    try:
+                        self.client.add_comment(task_id, self.agent_id, text)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to post completion comment: {e}")
                 else:
                     error_msg = internal_task.error or 'Task failed for unknown reason'
                     self.client.update_task_status(task_id, 'failed', error_msg)
                     self.logger.error(f"Task {task_id} failed: {error_msg}")
+                    # BUG-P14: Post terminal failure comment
+                    elapsed = int(time.time() - start_time)
+                    steps = len(getattr(internal_task, 'progress', []) or [])
+                    text = f"❌ 任务失败\n耗时：{elapsed}s | 步数：{steps}\n原因：{error_msg[:300]}"
+                    try:
+                        self.client.add_comment(task_id, self.agent_id, text)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to post failure comment: {e}")
 
             except Exception as e:
                 self.logger.error(f"Error executing task {task_id}: {e}")
-                self.client.update_task_status(task_id, 'failed', f"Execution error: {e}")
+                error_msg = f"Execution error: {e}"
+                self.client.update_task_status(task_id, 'failed', error_msg)
+                # BUG-P14: Post terminal failure comment for exception path
+                try:
+                    elapsed = int(time.time() - start_time)
+                    steps = len(getattr(internal_task, 'progress', []) or [])
+                    text = f"❌ 任务失败\n耗时：{elapsed}s | 步数：{steps}\n原因：{str(e)[:300]}"
+                    self.client.add_comment(task_id, self.agent_id, text)
+                except Exception as ce:
+                    self.logger.warning(f"Failed to post failure comment: {ce}")
 
             finally:
                 self.current_task = None
+                self._last_progress_step = 0  # Reset progress tracking
 
         except Exception as e:
             self._poll_error_count += 1
@@ -564,6 +610,48 @@ class RapperDaemon:
                 self.logger.debug(f"Heartbeat sent for task {task_id}")
             else:
                 self.logger.warning(f"Failed to send heartbeat for task {task_id}")
+
+            # Send progress update comment if there's new progress
+            if self.current_task:
+                board_task_id, internal_task = self.current_task
+                if board_task_id == task_id:
+                    self._send_progress_update(board_task_id, internal_task)
+
+    def _send_progress_update(self, board_task_id: str, internal_task):
+        """Send progress update comment to Board task if there's new progress."""
+        try:
+            # Reload task from disk to get latest progress
+            fresh_task = Task.load(internal_task.id)
+            progress = (getattr(fresh_task, 'progress', []) if fresh_task else []) or []
+            if not progress:
+                # Fall back to in-memory task progress
+                progress = getattr(internal_task, 'progress', []) or []
+            if not progress:
+                return
+
+            step_count = len(progress)
+
+            # Only send update if there's new progress
+            if step_count <= self._last_progress_step:
+                return
+
+            # Get the latest tool call for summary
+            latest = progress[-1] if progress else {}
+            tool_name = latest.get('tool', latest.get('name', '?'))
+
+            # Create progress message matching spec format
+            text = f"⏳ 执行中：已完成 {step_count} 步 | 最近工具：{tool_name}"
+
+            # Post comment to Board
+            try:
+                self.client.add_comment(board_task_id, self.agent_id, text)
+                self._last_progress_step = step_count
+                self.logger.debug(f"Posted progress update for task {board_task_id}: {step_count} steps")
+            except Exception as e:
+                self.logger.warning(f"Failed to post progress comment: {e}")
+
+        except Exception as e:
+            self.logger.debug(f"Error sending progress update for task {board_task_id}: {e}")
 
     def _make_request(self, method: str, endpoint: str, data: Any = None) -> Dict[str, Any]:
         """Direct API request using daemon's own credentials (bypasses outbound_guard)."""
