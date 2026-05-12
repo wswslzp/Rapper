@@ -26,7 +26,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from typing import Any, Callable
+from lib.db import init_db, save_task as db_save, load_task as db_load, list_tasks as db_list
 
 try:
     import yaml
@@ -81,7 +84,7 @@ class Task:
         return TASK_DIR / f"{self.id}.progress"
 
     def save(self):
-        """Save task state to disk."""
+        """Save task state to database."""
         data = {
             "id": self.id,
             "name": self.name,
@@ -108,21 +111,15 @@ class Task:
             "progress": self.progress[-20:],  # Keep last 20 tool calls
             "updated_at": time.time(),
         }
-        # Atomic write
-        tmp = self.task_file.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        tmp.rename(self.task_file)
+        db_save(data)
     
     @classmethod
     def load(cls, task_id: str) -> Task | None:
-        """Load task from disk."""
-        task_file = TASK_DIR / f"{task_id}.json"
-        if not task_file.exists():
+        """Load task from database."""
+        data = db_load(task_id)
+        if not data:
             return None
         try:
-            with open(task_file) as f:
-                data = json.load(f)
             task = cls(
                 id=data["id"],
                 name=data["name"],
@@ -147,7 +144,6 @@ class Task:
                 board_task_id=data.get("board_task_id"),
                 progress=data.get("progress", []),
             )
-            # Note: workdir_effective is not stored in Task object, only in JSON for status reporting
             return task
         except Exception:
             return None
@@ -432,7 +428,7 @@ Import and use these functions to interact with the Kanban board:
 ```python
 import sys
 sys.path.append('{rapper_dir}/lib')
-from board_tools import board_move_task, board_add_comment, board_get_task, board_my_tasks
+from board_tools import board_move_task, board_add_comment, board_get_task, board_my_tasks, board_create_task
 
 # Move a task to different column
 result = board_move_task("task_abc123", "doing")
@@ -449,9 +445,20 @@ print(result)
 # List my assigned tasks
 result = board_my_tasks("todo", 5)
 print(result)
+
+# Create a new task (cross-project example with workdir)
+result = board_create_task(
+    title="Fix auth bug in agent-board",
+    description="Fix authentication issue in the Agent Board project",
+    workdir="/app/agent-board/repo",  # Cross-project working directory
+    assignee="rapper-2",
+    priority="high"
+)
+print(result)
 ```
 
 Functions available:
+- **board_create_task(title, description, assignee=None, workdir=None, column='todo', priority='normal', project_id=None)**: Create new task (workdir enables cross-project tasks)
 - **board_move_task(task_id, column)**: Move task to 'todo', 'doing', 'done', 'failed', etc.
 - **board_add_comment(task_id, comment, author=None)**: Add comment to task
 - **board_get_task(task_id)**: Get detailed task information
@@ -801,13 +808,39 @@ def remove_worktree(worktree_path: str, workdir: str) -> bool:
 
 def list_tasks(status: str | None = None, limit: int = 20) -> list[Task]:
     """List all tasks, optionally filtered by status."""
+    task_data_list = db_list(status)
     tasks = []
-    for task_file in sorted(TASK_DIR.glob("*.json"), reverse=True):
-        task = Task.load(task_file.stem)
-        if task and (status is None or task.status == status):
+    for data in task_data_list:
+        try:
+            task = Task(
+                id=data["id"],
+                name=data["name"],
+                prompt=data.get("prompt", ""),
+                workdir=data.get("workdir", ""),
+                status=data.get("status", "unknown"),
+                pid=data.get("pid"),
+                start_time=data.get("start_time"),
+                end_time=data.get("end_time"),
+                exit_code=data.get("exit_code"),
+                result=data.get("result"),
+                structured_result=data.get("structured_result"),
+                error=data.get("error"),
+                fail_reason=data.get("fail_reason"),
+                session_id=data.get("session_id"),
+                max_budget_usd=data.get("max_budget_usd"),
+                fallback_model=data.get("fallback_model"),
+                worktree_path=data.get("worktree_path"),
+                branch_name=data.get("branch_name"),
+                repo_workdir=data.get("repo_workdir"),
+                claude_version=data.get("claude_version"),
+                board_task_id=data.get("board_task_id"),
+                progress=data.get("progress", []),
+            )
             tasks.append(task)
-        if len(tasks) >= limit:
-            break
+            if len(tasks) >= limit:
+                break
+        except Exception:
+            continue  # Skip invalid task data
     return tasks
 
 
@@ -868,7 +901,7 @@ def cancel_task(task_id: str) -> bool:
 class TaskRunner:
     """Runs Claude Code tasks in background."""
     
-    def __init__(self, 
+    def __init__(self,
                  claude_path: str = "claude",
                  default_model: str = "claude-sonnet-4-20250514",
                  rapper_dir: str | None = None):
@@ -876,6 +909,7 @@ class TaskRunner:
         self.default_model = default_model
         self.rapper_dir = rapper_dir or os.environ.get("RAPPER_DIR", "/app/rapper")
         self._running_tasks: dict[str, subprocess.Popen] = {}
+        init_db()
     
     def start_task(self,
                    name: str,

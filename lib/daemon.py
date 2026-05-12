@@ -13,6 +13,8 @@ Usage:
 """
 
 import json
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import logging
 import os
 import signal
@@ -34,6 +36,7 @@ import yaml
 # Add lib to path for imports
 sys.path.insert(0, os.path.dirname(__file__))
 from task_runner import Task, TaskRunner, generate_task_id
+from lib.db import init_db, get_running_count
 
 
 @dataclass
@@ -117,10 +120,30 @@ class AgentBoardClient:
         except (URLError, json.JSONDecodeError):
             return False
 
-    def get_tasks(self, assignee: str, column: str = "todo") -> List[Dict[str, Any]]:
-        """Get tasks assigned to this agent."""
+    def get_tasks(self, assignee: Optional[str] = None, column: str = "todo") -> List[Dict[str, Any]]:
+        """Get tasks by column, optionally filtered by assignee.
+
+        Args:
+            assignee: Filter by assignee. If None, returns all tasks in column.
+                     For backward compatibility, also accepts assignee as first positional arg.
+            column: Column to query (default: "todo")
+
+        Returns:
+            List of tasks matching criteria
+        """
         try:
-            response = self._make_request('GET', f'/api/tasks?assignee={assignee}&column={column}')
+            # Build query parameters
+            params = [f'column={column}']
+
+            # Handle both old and new calling patterns:
+            # Old: get_tasks(assignee_string, column_string)
+            # New: get_tasks(None, column_string) for column-only queries
+            if assignee is not None:
+                params.append(f'assignee={assignee}')
+
+            query_string = '&'.join(params)
+            response = self._make_request('GET', f'/api/tasks?{query_string}')
+
             # API returns a list directly, not a {"tasks": [...]} wrapper
             if isinstance(response, list):
                 return response
@@ -129,7 +152,7 @@ class AgentBoardClient:
             return []
 
     def claim_task(self, task_id: str, agent_id: str, retries: int = 3) -> bool:
-        """Atomically claim a task by moving it to 'doing' column.
+        """Atomically claim a task by moving it to 'doing' column and setting assignee.
 
         This is the core of Method A: claim BEFORE execution so the task
         is no longer visible in todo on the next poll, even if execution
@@ -137,7 +160,7 @@ class AgentBoardClient:
 
         Args:
             task_id: Board task ID to claim.
-            agent_id: Agent ID (used for the initial comment).
+            agent_id: Agent ID to assign the task to.
             retries: Number of retry attempts on transient errors.
 
         Returns:
@@ -145,6 +168,7 @@ class AgentBoardClient:
         """
         payload = {
             'column': 'doing',
+            'assignee': agent_id,
             'lastHeartbeat': datetime.utcnow().isoformat() + 'Z',
         }
         for attempt in range(1, retries + 1):
@@ -254,6 +278,9 @@ class RapperDaemon:
 
         # Setup logging
         self._setup_logging()
+
+        # Initialize database
+        init_db()
 
         # Initialize components
         self.client = AgentBoardClient(
@@ -447,11 +474,32 @@ class RapperDaemon:
     def _poll_and_execute_tasks(self):
         """Poll for tasks and execute them."""
         try:
-            tasks = self.client.get_tasks(self.agent_id, 'todo')
+            # NEW APPROACH: Query by column only, then filter client-side
+            # This allows us to see unassigned tasks that were moved to todo
+            all_todo_tasks = self.client.get_tasks(None, 'todo')
             self._poll_error_count = 0  # reset on successful poll
 
-            if not tasks:
-                self.logger.debug("No tasks found")
+            if not all_todo_tasks:
+                self.logger.debug("No tasks found in todo column")
+                return
+
+            # Filter for tasks this agent can claim:
+            # 1. Unassigned tasks (assignee=null) - these can be claimed
+            # 2. Tasks already assigned to this agent - these can be resumed
+            # 3. Exclude tasks assigned to other agents
+            claimable_tasks = []
+            for task in all_todo_tasks:
+                assignee = task.get('assignee')
+                if assignee is None or assignee == self.agent_id:
+                    claimable_tasks.append(task)
+
+            if not claimable_tasks:
+                assigned_count = len([t for t in all_todo_tasks if t.get('assignee')])
+                unassigned_count = len(all_todo_tasks) - assigned_count
+                self.logger.debug(
+                    f"No claimable tasks found in todo ({unassigned_count} unassigned, "
+                    f"{assigned_count} assigned to other agents)"
+                )
                 return
 
             # Load picked tasks for deduplication (Solution B — file-based)
@@ -472,10 +520,10 @@ class RapperDaemon:
                 self.logger.warning(f"Could not fetch doing tasks for deduplication: {e}")
 
             # Filter out already picked / already-doing tasks
-            available_tasks = [task for task in tasks if task['id'] not in picked_tasks]
+            available_tasks = [task for task in claimable_tasks if task['id'] not in picked_tasks]
 
             if not available_tasks:
-                self.logger.debug(f"No new tasks found (filtered {len(tasks)} already picked)")
+                self.logger.debug(f"No new tasks found (filtered {len(claimable_tasks)} already picked)")
                 return
 
             # Check concurrency limit before processing tasks
@@ -658,24 +706,9 @@ class RapperDaemon:
         return self.client._make_request(method, endpoint, data)
 
     def _count_running_tasks(self) -> int:
-        """Count running tasks — only check recent files to avoid scanning 400+ historical task files."""
-        import glob as _glob
-        import time as _time
+        """Count running tasks using SQLite query."""
         try:
-            tasks_dir = os.path.expanduser('~/.rapper/tasks')
-            cutoff = _time.time() - 86400  # only look at files from last 24h
-            count = 0
-            for f in _glob.glob(os.path.join(tasks_dir, '*.json')):
-                try:
-                    if os.path.getmtime(f) < cutoff:
-                        continue
-                    with open(f) as fp:
-                        d = json.load(fp)
-                    if d.get('status') == 'running':
-                        count += 1
-                except Exception:
-                    continue
-            return count
+            return get_running_count()
         except Exception as e:
             self.logger.error(f'Error counting running tasks: {e}')
             return 0
