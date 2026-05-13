@@ -474,13 +474,15 @@ class RapperDaemon:
     def _poll_and_execute_tasks(self):
         """Poll for tasks and execute them."""
         try:
-            # NEW APPROACH: Query by column only, then filter client-side
-            # This allows us to see unassigned tasks that were moved to todo
+            # Query both todo and ready columns for comprehensive task pickup
+            # This allows daemon to pickup both manually assigned (todo) and auto-promoted (ready) tasks
             all_todo_tasks = self.client.get_tasks(None, 'todo')
+            all_ready_tasks = self.client.get_tasks(None, 'ready')
+            all_tasks = all_todo_tasks + all_ready_tasks
             self._poll_error_count = 0  # reset on successful poll
 
-            if not all_todo_tasks:
-                self.logger.debug("No tasks found in todo column")
+            if not all_tasks:
+                self.logger.debug("No tasks found in todo or ready columns")
                 return
 
             # Filter for tasks this agent can claim:
@@ -488,17 +490,17 @@ class RapperDaemon:
             # 2. Tasks already assigned to this agent - these can be resumed
             # 3. Exclude tasks assigned to other agents
             claimable_tasks = []
-            for task in all_todo_tasks:
+            for task in all_tasks:
                 assignee = task.get('assignee')
                 if assignee is None or assignee == self.agent_id:
                     claimable_tasks.append(task)
 
             if not claimable_tasks:
-                assigned_count = len([t for t in all_todo_tasks if t.get('assignee')])
-                unassigned_count = len(all_todo_tasks) - assigned_count
+                assigned_count = len([t for t in all_tasks if t.get('assignee')])
+                unassigned_count = len(all_tasks) - assigned_count
                 self.logger.debug(
-                    f"No claimable tasks found in todo ({unassigned_count} unassigned, "
-                    f"{assigned_count} assigned to other agents)"
+                    f"No claimable tasks found in todo/ready ({unassigned_count} unassigned, "
+                    f"{assigned_count} assigned to other agents, {len(all_todo_tasks)} todo, {len(all_ready_tasks)} ready)"
                 )
                 return
 
