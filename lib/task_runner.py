@@ -66,6 +66,8 @@ class Task:
     claude_version: str | None = None     # Claude Code version when task started
     board_task_id: str | None = None      # Agent Board task ID (e.g., task_7f25a48f)
     progress: list[dict] = field(default_factory=list)  # tool calls
+    created_at: str | None = None         # ISO timestamp when task was first created
+    completed_at: str | None = None       # ISO timestamp when task reached terminal status
     
     @property
     def task_file(self) -> Path:
@@ -85,6 +87,18 @@ class Task:
 
     def save(self):
         """Save task state to database."""
+        # Auto-set timestamps
+        current_time_iso = datetime.fromtimestamp(time.time()).isoformat()
+
+        # Set created_at if this is the first save
+        if self.created_at is None:
+            self.created_at = current_time_iso
+
+        # Set completed_at if status is terminal and not already set
+        terminal_statuses = {'completed', 'failed', 'cancelled'}
+        if self.status in terminal_statuses and self.completed_at is None:
+            self.completed_at = current_time_iso
+
         data = {
             "id": self.id,
             "name": self.name,
@@ -109,6 +123,8 @@ class Task:
             "claude_version": self.claude_version,
             "board_task_id": self.board_task_id,
             "progress": self.progress[-20:],  # Keep last 20 tool calls
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
             "updated_at": time.time(),
         }
         db_save(data)
@@ -143,6 +159,8 @@ class Task:
                 claude_version=data.get("claude_version"),
                 board_task_id=data.get("board_task_id"),
                 progress=data.get("progress", []),
+                created_at=data.get("created_at"),
+                completed_at=data.get("completed_at"),
             )
             return task
         except Exception:
@@ -835,6 +853,8 @@ def list_tasks(status: str | None = None, limit: int = 20) -> list[Task]:
                 claude_version=data.get("claude_version"),
                 board_task_id=data.get("board_task_id"),
                 progress=data.get("progress", []),
+                created_at=data.get("created_at"),
+                completed_at=data.get("completed_at"),
             )
             tasks.append(task)
             if len(tasks) >= limit:

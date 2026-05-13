@@ -4,6 +4,7 @@ import os
 import pathlib
 import shutil
 import datetime
+import time
 
 DEFAULT_DB_PATH = os.path.expanduser('~/.rapper/tasks.db')
 
@@ -123,7 +124,38 @@ def get_running_count():
 
 def save_task(d):
     """Save task data to database."""
+    if db_path is None:
+        raise ValueError("Database not initialized. Call init_db() first.")
     conn = sqlite3.connect(db_path)
+
+    # Load existing task to preserve timestamps if not explicitly provided
+    existing_task = None
+    if 'id' in d:
+        cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (d['id'],))
+        row = cursor.fetchone()
+        if row:
+            # Convert to dict using column names
+            columns = [desc[0] for desc in cursor.description]
+            existing_task = dict(zip(columns, row))
+
+    # Auto-set timestamps if not already set (safety net)
+    current_time_iso = datetime.datetime.fromtimestamp(time.time()).isoformat()
+
+    # Set created_at if missing (preserve existing if available)
+    if 'created_at' not in d or d.get('created_at') is None:
+        if existing_task and existing_task.get('created_at'):
+            d['created_at'] = existing_task['created_at']
+        else:
+            d['created_at'] = current_time_iso
+
+    # Set completed_at if status is terminal and not already set (preserve existing if available)
+    terminal_statuses = {'completed', 'failed', 'cancelled'}
+    status = d.get('status')
+    if status in terminal_statuses and ('completed_at' not in d or d.get('completed_at') is None):
+        if existing_task and existing_task.get('completed_at'):
+            d['completed_at'] = existing_task['completed_at']
+        else:
+            d['completed_at'] = current_time_iso
 
     # Handle structured_result serialization
     structured_result = None
@@ -168,6 +200,8 @@ def save_task(d):
 
 def load_task(task_id):
     """Load task data from database."""
+    if db_path is None:
+        raise ValueError("Database not initialized. Call init_db() first.")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 

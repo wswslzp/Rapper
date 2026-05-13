@@ -201,3 +201,131 @@ def test_running_count():
         # Verify running count
         running_count = db.get_running_count()
         assert running_count == 2
+
+
+class TestCompletedAt:
+    """Test completed_at field auto-population for terminal task states."""
+
+    def test_completed_status_auto_fills_completed_at(self):
+        """T1: save_task() should auto-fill completed_at for 'completed' status."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, 'test.db')
+            db.init_db(db_path)
+
+            # Save task with completed status (no completed_at provided)
+            task = {
+                'id': 'test-1',
+                'name': 'Completed Task',
+                'status': 'completed',
+                'pid': 123,
+                'result': 'Task completed successfully'
+            }
+            db.save_task(task)
+
+            # Load task from database
+            saved_task = db.load_task('test-1')
+
+            # SHOULD PASS: completed_at should be auto-filled with current timestamp
+            assert saved_task['completed_at'] is not None, "completed_at should be auto-filled for completed status"
+
+            # Verify it's a valid ISO timestamp
+            try:
+                datetime.datetime.fromisoformat(saved_task['completed_at'].replace('Z', '+00:00'))
+            except ValueError:
+                pytest.fail(f"completed_at should be valid ISO timestamp, got: {saved_task['completed_at']}")
+
+    def test_failed_status_auto_fills_completed_at(self):
+        """T2: save_task() should auto-fill completed_at for 'failed' status."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, 'test.db')
+            db.init_db(db_path)
+
+            # Save task with failed status (no completed_at provided)
+            task = {
+                'id': 'test-2',
+                'name': 'Failed Task',
+                'status': 'failed',
+                'pid': 456,
+                'error': 'Task failed with error'
+            }
+            db.save_task(task)
+
+            # Load task from database
+            saved_task = db.load_task('test-2')
+
+            # SHOULD PASS: completed_at should be auto-filled
+            assert saved_task['completed_at'] is not None, "completed_at should be auto-filled for failed status"
+
+    def test_cancelled_status_auto_fills_completed_at(self):
+        """T3: save_task() should auto-fill completed_at for 'cancelled' status."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, 'test.db')
+            db.init_db(db_path)
+
+            # Save task with cancelled status (no completed_at provided)
+            task = {
+                'id': 'test-3',
+                'name': 'Cancelled Task',
+                'status': 'cancelled',
+                'pid': 789
+            }
+            db.save_task(task)
+
+            # Load task from database
+            saved_task = db.load_task('test-3')
+
+            # SHOULD PASS: completed_at should be auto-filled
+            assert saved_task['completed_at'] is not None, "completed_at should be auto-filled for cancelled status"
+
+    def test_existing_completed_at_not_overwritten(self):
+        """T4: save_task() should not overwrite existing completed_at for terminal states."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, 'test.db')
+            db.init_db(db_path)
+
+            original_timestamp = '2026-01-01T00:00:00Z'
+
+            # First save: task with existing completed_at
+            task = {
+                'id': 'test-4',
+                'name': 'Task with preset timestamp',
+                'status': 'running',
+                'completed_at': original_timestamp
+            }
+            db.save_task(task)
+
+            # Second save: update status to completed (don't pass completed_at)
+            task_updated = {
+                'id': 'test-4',
+                'name': 'Task with preset timestamp',
+                'status': 'completed',
+                'result': 'Done'
+            }
+            db.save_task(task_updated)
+
+            # Load and verify existing timestamp preserved
+            saved_task = db.load_task('test-4')
+
+            # SHOULD PASS: original completed_at should be preserved
+            assert saved_task['completed_at'] == original_timestamp, f"Existing completed_at should not be overwritten, expected {original_timestamp}, got {saved_task['completed_at']}"
+
+    def test_non_terminal_status_no_completed_at(self):
+        """T5: Non-terminal states should not get completed_at auto-filled."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, 'test.db')
+            db.init_db(db_path)
+
+            # Test running status (non-terminal)
+            task = {
+                'id': 'test-5',
+                'name': 'Running Task',
+                'status': 'running',
+                'pid': 999
+            }
+            db.save_task(task)
+
+            # Load task from database
+            saved_task = db.load_task('test-5')
+
+            # SHOULD PASS: completed_at should remain null for non-terminal states
+            assert saved_task.get('completed_at') is None, "Non-terminal status 'running' should not get completed_at"
