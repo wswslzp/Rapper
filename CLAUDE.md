@@ -179,6 +179,24 @@ tasks:
 
 **Launcher:** `launch_daemons.py` starts multiple named daemons (rapper-1/2/3) from individual config files at `~/.rapper/config-rapper-{1,2,3}.yaml`.
 
+### Task Assignment Behavior
+
+**Fixed in daemon query relaxation update:** Daemon now handles unassigned tasks that are moved to the todo column via Board UI.
+
+**Previous behavior (problematic):**
+- Daemon queried `GET /api/tasks?assignee=agent_id&column=todo`
+- Tasks dragged from backlog→todo without assignee were never picked up
+
+**Current behavior (fixed):**
+- Daemon queries `GET /api/tasks?column=todo` (no assignee requirement)  
+- Client-side filtering for claimable tasks:
+  - ✅ Unassigned tasks (`assignee=null`) - can be claimed
+  - ✅ Tasks assigned to this agent - can be resumed
+  - ❌ Tasks assigned to other agents - excluded
+- Backward compatibility maintained for `get_tasks(assignee, column)` calls
+
+This resolves **Pitfall #7b/#20** where manual Board UI task moves didn't set assignees.
+
 ## MCP Servers
 
 | Server | Function |

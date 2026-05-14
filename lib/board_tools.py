@@ -292,6 +292,65 @@ def board_my_tasks(status: Optional[str] = None, limit: int = 10) -> str:
         return f"❌ Failed to get tasks: {e}"
 
 
+def board_create_task(title: str, description: str, assignee: Optional[str] = None,
+                      workdir: Optional[str] = None, column: str = "todo",
+                      priority: str = "normal", project_id: Optional[str] = None) -> str:
+    """Create a new task on the Agent Board.
+
+    Args:
+        title: Task title (required)
+        description: Task description (required)
+        assignee: Task assignee (optional, defaults to current agent)
+        workdir: Working directory for task execution (optional, enables cross-project tasks)
+        column: Initial column/status (default: 'todo')
+        priority: Task priority ('urgent', 'high', 'normal', 'low')
+        project_id: Project ID (optional)
+
+    Returns:
+        Success message with created task details
+    """
+    try:
+        config = get_board_config()
+
+        if not assignee:
+            assignee = config.get("agent_id", "rapper-1")
+
+        # Prepare task data
+        task_data = {
+            "title": title,
+            "description": description,
+            "assignee": assignee,
+            "column": column,
+            "priority": priority
+        }
+
+        # Add optional fields only if provided
+        if workdir:
+            task_data["workdir"] = workdir
+        if project_id:
+            task_data["projectId"] = project_id
+
+        # Create the task
+        result = make_board_request("POST", "/tasks", task_data)
+
+        task_id = result.get("id", "unknown")
+        success_msg = f"✅ Created task '{title}' (ID: {task_id})"
+
+        if workdir:
+            success_msg += f"\n📁 Workdir: {workdir}"
+
+        success_msg += f"\n👤 Assignee: {assignee}"
+        success_msg += f"\n📍 Column: {column}"
+
+        if priority != "normal":
+            success_msg += f"\n🚦 Priority: {priority}"
+
+        return success_msg
+
+    except Exception as e:
+        return f"❌ Failed to create task: {e}"
+
+
 # Tool Schema Definitions for Claude Code Integration
 
 BOARD_TOOLS = {
@@ -368,6 +427,47 @@ BOARD_TOOLS = {
                 }
             },
             "required": []
+        }
+    },
+    "board_create_task": {
+        "description": "Create a new task on the Agent Board",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Task title"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Task description"
+                },
+                "assignee": {
+                    "type": "string",
+                    "description": "Task assignee (optional, defaults to current agent)"
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory for task execution (enables cross-project tasks, e.g. '/app/agent-board/repo')"
+                },
+                "column": {
+                    "type": "string",
+                    "description": "Initial column/status (default: 'todo')",
+                    "enum": ["backlog", "ready", "todo", "doing", "blocked", "review", "done", "failed"],
+                    "default": "todo"
+                },
+                "priority": {
+                    "type": "string",
+                    "description": "Task priority (default: 'normal')",
+                    "enum": ["urgent", "high", "normal", "low"],
+                    "default": "normal"
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Project ID (optional)"
+                }
+            },
+            "required": ["title", "description"]
         }
     }
 }

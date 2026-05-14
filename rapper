@@ -359,6 +359,34 @@ do_task_list() {
     running_count=$(count_running_tasks)
     max_concurrent=$(get_max_concurrent)
 
+    # Check for unmerged worktrees first and show prominent warning
+    local unmerged_info
+    unmerged_info=$(python3 -c "
+import sys, json
+sys.path.insert(0, '${RAPPER_DIR}/lib')
+from task_runner import list_tasks, get_unmerged_worktrees_summary
+
+try:
+    tasks = list_tasks()
+    unmerged_count, unmerged_tasks = get_unmerged_worktrees_summary(tasks)
+    print(json.dumps({'count': unmerged_count, 'tasks': [{'id': t.id, 'name': t.name} for t, _ in unmerged_tasks[:3]]}))
+except:
+    print(json.dumps({'count': 0, 'tasks': []}))
+" 2>/dev/null)
+
+    if [[ -n "$unmerged_info" ]]; then
+        local unmerged_count
+        unmerged_count=$(echo "$unmerged_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['count'])")
+
+        if [[ "$unmerged_count" -gt 0 ]]; then
+            echo "========================================================================"
+            echo "🚨 HERMES: ${unmerged_count} completed task(s) need merging!"
+            echo "   Run: rapper --merge-all"
+            echo "========================================================================"
+            echo ""
+        fi
+    fi
+
     echo "Current running: $running_count / $max_concurrent"
     echo ""
     "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py" list ${status:+--status "$status"}
@@ -555,6 +583,63 @@ else:
         exit 1
     fi
 
+    # Pre-merge conflict resolution
+    log_info "Checking for potential merge conflicts in main branch..."
+
+    # Check for uncommitted changes in main branch that might conflict
+    local main_dirty stash_created=false
+    main_dirty=$(git -C "$merge_target" status --porcelain 2>/dev/null)
+
+    if [[ -n "$main_dirty" ]]; then
+        log_warn "Main branch has uncommitted changes that may conflict:"
+        echo "$main_dirty" | sed 's/^/  /'
+
+        # Separate __pycache__ files from other changes
+        local pycache_files other_files
+        pycache_files=$(echo "$main_dirty" | grep '__pycache__' | awk '{print $2}' || true)
+        other_files=$(echo "$main_dirty" | grep -v '__pycache__' || true)
+
+        # Handle __pycache__ files by discarding them (short-term fix)
+        if [[ -n "$pycache_files" ]]; then
+            log_info "Discarding __pycache__ bytecode conflicts..."
+            while IFS= read -r file; do
+                if [[ -n "$file" ]]; then
+                    log_info "  Discarding: $file"
+                    git -C "$merge_target" checkout -- "$file" 2>/dev/null || \
+                        rm -f "$merge_target/$file" 2>/dev/null || true
+                fi
+            done <<< "$pycache_files"
+        fi
+
+        # Handle other tracked files by stashing them
+        if [[ -n "$other_files" ]]; then
+            log_info "Stashing other uncommitted changes to avoid conflicts..."
+            local stash_msg="rapper-merge-$(date +%s): pre-merge stash for task $task_id"
+            if git -C "$merge_target" stash push -m "$stash_msg"; then
+                stash_created=true
+                log_ok "Created stash: $stash_msg"
+            else
+                log_error "Failed to stash uncommitted changes. Manual resolution required."
+                log_error "Either commit, stash, or discard these changes before merging:"
+                echo "$other_files" | sed 's/^/  /'
+                exit 1
+            fi
+        fi
+
+        # Verify main branch is now clean
+        local main_dirty_after
+        main_dirty_after=$(git -C "$merge_target" status --porcelain 2>/dev/null)
+        if [[ -n "$main_dirty_after" ]]; then
+            log_error "Main branch still has uncommitted changes after cleanup:"
+            echo "$main_dirty_after" | sed 's/^/  /'
+            log_error "Manual intervention required before merge can proceed."
+            exit 1
+        fi
+        log_ok "Main branch is now clean for merge"
+    else
+        log_info "Main branch is clean - no pre-merge conflicts to handle"
+    fi
+
     # Merge the branch
     log_info "Executing merge: git -C '$merge_target' merge '$branch_name'"
     local merge_output
@@ -562,6 +647,37 @@ else:
     local merge_status=$?
 
     echo "$merge_output"
+
+    # Handle merge result and stash restoration
+    if [[ $merge_status -eq 0 ]]; then
+        # Merge succeeded - restore stashed changes if any
+        if [[ "$stash_created" == "true" ]]; then
+            log_info "Merge successful - attempting to restore stashed changes..."
+            local stash_restore_output
+            stash_restore_output=$(git -C "$merge_target" stash pop 2>&1)
+            local stash_status=$?
+
+            if [[ $stash_status -eq 0 ]]; then
+                log_ok "Successfully restored pre-merge stashed changes"
+                log_info "$stash_restore_output"
+            else
+                log_warn "Failed to restore stashed changes (conflicts may exist):"
+                echo "$stash_restore_output" | sed 's/^/  /'
+                log_warn "Resolve conflicts and run: git -C $merge_target stash drop"
+                log_warn "Or keep the stash with: git -C $merge_target stash list"
+            fi
+        fi
+    else
+        # Merge failed - restore stashed changes to original state
+        if [[ "$stash_created" == "true" ]]; then
+            log_error "Merge failed - restoring stashed changes..."
+            if git -C "$merge_target" stash pop 2>/dev/null; then
+                log_info "Pre-merge state restored"
+            else
+                log_warn "Could not restore stashed changes - check: git -C $merge_target stash list"
+            fi
+        fi
+    fi
 
     if [[ $merge_status -eq 0 ]]; then
         # Check if it was a real merge or "Already up to date"
@@ -611,6 +727,189 @@ else:
     fi
 }
 
+do_merge_all() {
+    log_info "Merging all unmerged worktree branches..."
+
+    # Get list of unmerged tasks using task_runner.py
+    local unmerged_tasks
+    unmerged_tasks=$(python3 -c "
+import sys, json
+sys.path.insert(0, '${RAPPER_DIR}/lib')
+from task_runner import list_tasks, get_unmerged_worktrees_summary
+
+tasks = list_tasks()
+unmerged_count, unmerged_tasks = get_unmerged_worktrees_summary(tasks)
+
+if unmerged_count == 0:
+    print(json.dumps({'unmerged': []}))
+else:
+    result = []
+    for task, commit_count in unmerged_tasks:
+        result.append({
+            'id': task.id,
+            'name': task.name,
+            'branch_name': task.branch_name,
+            'commit_count': commit_count
+        })
+    print(json.dumps({'unmerged': result}))
+" 2>/dev/null)
+
+    if [[ -z "$unmerged_tasks" ]]; then
+        log_error "Failed to query unmerged tasks"
+        exit 1
+    fi
+
+    local unmerged_list
+    unmerged_list=$(echo "$unmerged_tasks" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['unmerged']))")
+
+    if [[ "$unmerged_list" -eq 0 ]]; then
+        log_info "No unmerged worktrees found - nothing to merge"
+        exit 0
+    fi
+
+    log_info "Found $unmerged_list unmerged worktree(s) to merge:"
+
+    # Extract task IDs for merging
+    local task_ids
+    task_ids=$(echo "$unmerged_tasks" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for task in d['unmerged']:
+    print(f\"{task['id']} {task['name']} ({task['branch_name']}) - {task['commit_count']} commits\")
+")
+
+    echo "$task_ids" | sed 's/^/  /'
+    echo
+
+    # Ask for confirmation unless --force is used
+    echo -n "Proceed with merging all unmerged worktrees? [y/N]: "
+    read -r response
+    case "$response" in
+        [yY][eE][sS]|[yY])
+            log_info "Proceeding with bulk merge..."
+            ;;
+        *)
+            log_info "Merge cancelled by user"
+            exit 0
+            ;;
+    esac
+
+    # Merge each task
+    local success_count=0 failed_count=0
+    local failed_tasks=()
+
+    echo "$unmerged_tasks" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for task in d['unmerged']:
+    print(task['id'])
+" | while IFS= read -r task_id; do
+        if [[ -n "$task_id" ]]; then
+            echo
+            log_info "==================== Merging task: $task_id ===================="
+
+            if do_merge "$task_id"; then
+                ((success_count++)) || true
+                log_ok "✓ Successfully merged task: $task_id"
+            else
+                ((failed_count++)) || true
+                failed_tasks+=("$task_id")
+                log_error "✗ Failed to merge task: $task_id"
+            fi
+        fi
+    done
+
+    # Summary
+    echo
+    log_info "==================== Merge Summary ===================="
+    log_info "Total tasks processed: $unmerged_list"
+    log_ok   "Successfully merged: $success_count"
+    if [[ $failed_count -gt 0 ]]; then
+        log_error "Failed to merge: $failed_count"
+        log_error "Failed tasks: ${failed_tasks[*]}"
+        log_error "Review errors above and merge failed tasks manually"
+        exit 1
+    else
+        log_ok "All unmerged worktrees successfully merged!"
+    fi
+}
+
+check_repo_conflicts() {
+    local target_workdir="$1"
+    local use_worktree="$2"
+
+    # Get canonical path to avoid symlink issues
+    local canonical_workdir
+    canonical_workdir=$(realpath "$target_workdir" 2>/dev/null) || canonical_workdir="$target_workdir"
+
+    # Check running tasks for repo conflicts
+    local conflict_tasks=()
+
+    # Use Python to query running tasks and check for conflicts
+    local conflict_check_result
+    conflict_check_result=$("${RAPPER_DIR}/.venv/bin/python3" -c "
+import sys
+import os
+sys.path.insert(0, '${RAPPER_DIR}/lib')
+from task_runner import list_tasks
+
+canonical_target = os.path.realpath('${canonical_workdir}')
+use_worktree = '${use_worktree}' == 'true'
+
+conflicts = []
+running_tasks = list_tasks(status='running')
+
+for task in running_tasks:
+    # Get canonical path of task workdir
+    task_canonical = os.path.realpath(task.workdir) if task.workdir else ''
+
+    # Check if same repository
+    if task_canonical == canonical_target:
+        # Same repo detected - check isolation
+        task_has_worktree = task.worktree_path is not None and task.worktree_path != ''
+
+        if not use_worktree and not task_has_worktree:
+            # Both tasks without worktree in same repo = CONFLICT
+            conflicts.append({
+                'id': task.id,
+                'name': task.name,
+                'workdir': task.workdir,
+                'has_worktree': task_has_worktree
+            })
+
+if conflicts:
+    print('CONFLICT_DETECTED')
+    for conflict in conflicts:
+        print(f\"CONFLICT_TASK:{conflict['id']}:{conflict['name']}:{conflict['workdir']}:{conflict['has_worktree']}\")
+else:
+    print('NO_CONFLICT')
+" 2>/dev/null)
+
+    if [[ "$conflict_check_result" == *"CONFLICT_DETECTED"* ]]; then
+        log_error "Repository conflict detected!"
+        log_error "Another task is already running in the same repository without worktree isolation:"
+        log_error ""
+
+        # Parse and display conflicting tasks
+        while IFS= read -r line; do
+            if [[ "$line" == CONFLICT_TASK:* ]]; then
+                IFS=':' read -r prefix task_id task_name task_workdir has_worktree <<< "$line"
+                log_error "  Task: $task_name (ID: $task_id)"
+                log_error "  Directory: $task_workdir"
+            fi
+        done <<< "$conflict_check_result"
+
+        log_error ""
+        log_error "To avoid data corruption, you must use worktree isolation:"
+        log_error "  rapper --background $name --worktree -p '$prompt' -w '$target_workdir'"
+        log_error ""
+        log_error "Or wait for the conflicting task to complete:"
+        log_error "  rapper --status <task_id>   # Check task status"
+        log_error "  rapper --cancel <task_id>   # Cancel if needed"
+        exit 1
+    fi
+}
+
 do_background() {
     local name="${1:?Task name required}"
     shift
@@ -619,6 +918,7 @@ do_background() {
     local budget=""
     local fallback_model=""
     local use_worktree=false
+    local auto_merge=false
     local max_turns="200"
     local board_task_id=""
 
@@ -632,8 +932,6 @@ do_background() {
         log_error "Please wait for some tasks to complete or cancel running tasks."
         exit 1
     fi
-
-    # Parse remaining args
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -p)
@@ -654,6 +952,9 @@ do_background() {
                 ;;
             --worktree)
                 use_worktree=true
+                ;;
+            --auto-merge)
+                auto_merge=true
                 ;;
             --max-turns)
                 shift
@@ -678,6 +979,9 @@ do_background() {
         exit 1
     fi
 
+    # Check for parallel execution conflicts in the same repository
+    check_repo_conflicts "$workdir" "$use_worktree"
+
     log_info "Starting background task: $name"
     local cmd=(
         "${RAPPER_DIR}/.venv/bin/python3" "${RAPPER_DIR}/lib/task_runner.py"
@@ -694,6 +998,10 @@ do_background() {
 
     if [[ "$use_worktree" == "true" ]]; then
         cmd+=(--worktree)
+    fi
+
+    if [[ "$auto_merge" == "true" ]]; then
+        cmd+=(--auto-merge)
     fi
 
     if [[ -n "$board_task_id" ]]; then
@@ -880,6 +1188,11 @@ main() {
             do_merge "${1:?Task ID required}"
             exit 0
             ;;
+        --merge-all)
+            if needs_setup; then run_setup; fi
+            do_merge_all
+            exit 0
+            ;;
         --daemon)
             shift
             if needs_setup; then run_setup; fi
@@ -914,6 +1227,7 @@ BACKGROUND TASKS (autonomous):
     rapper --logs <task_id> [lines]        # View task logs
     rapper --cancel <task_id>              # Cancel running task
     rapper --merge <task_id>               # Merge worktree branch + cleanup
+    rapper --merge-all                     # Merge all unmerged worktree branches
 
 DAEMON MODE (Agent Board):
     rapper --daemon [--agent-id <id>] [--log-level <level>]  # Start persistent daemon

@@ -13,7 +13,7 @@ def test_board_tools_import():
     """Test that board tools can be imported."""
     print("Testing board tools import...")
     try:
-        from board_tools import board_move_task, board_add_comment, board_get_task, board_my_tasks, get_board_config
+        from board_tools import board_move_task, board_add_comment, board_get_task, board_my_tasks, board_create_task, get_board_config
         print("✅ Board tools imported successfully")
         return True
     except Exception as e:

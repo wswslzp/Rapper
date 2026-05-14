@@ -824,6 +824,77 @@ def remove_worktree(worktree_path: str, workdir: str) -> bool:
         return False
 
 
+def check_worktree_unmerged(task: Task) -> tuple[bool, int]:
+    """Check if a task's worktree has unmerged commits.
+
+    Returns (is_unmerged, commit_count).
+    """
+    if not task.worktree_path or not task.branch_name or not task.repo_workdir:
+        return False, 0
+
+    if not os.path.exists(task.worktree_path):
+        return False, 0
+
+    try:
+        # Check if branch has commits ahead of main/master
+        main_branch = "master"  # Could also try "main" as fallback
+
+        # First check if main branch exists
+        branch_check = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{main_branch}"],
+            cwd=task.repo_workdir,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if branch_check.returncode != 0:
+            # Try "main" if "master" doesn't exist
+            main_branch = "main"
+            branch_check = subprocess.run(
+                ["git", "rev-parse", "--verify", f"{main_branch}"],
+                cwd=task.repo_workdir,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if branch_check.returncode != 0:
+                return False, 0
+
+        # Count commits ahead of main branch
+        unmerged_check = subprocess.run([
+            "git", "rev-list", "--count", f"{main_branch}..{task.branch_name}"
+        ], cwd=task.repo_workdir, capture_output=True, text=True, timeout=10)
+
+        if unmerged_check.returncode == 0:
+            count = int(unmerged_check.stdout.strip())
+            return count > 0, count
+
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+    return False, 0
+
+
+def get_unmerged_worktrees_summary(tasks: list[Task]) -> tuple[int, list[tuple[Task, int]]]:
+    """Get summary of unmerged worktrees.
+
+    Returns (total_unmerged_count, list of (task, commit_count) for unmerged tasks).
+    """
+    unmerged_tasks = []
+    total_count = 0
+
+    for task in tasks:
+        # Only check completed/failed tasks with worktrees
+        if task.status in ["completed", "failed"] and task.worktree_path:
+            is_unmerged, commit_count = check_worktree_unmerged(task)
+            if is_unmerged:
+                unmerged_tasks.append((task, commit_count))
+                total_count += 1
+
+    return total_count, unmerged_tasks
+
+
 def list_tasks(status: str | None = None, limit: int = 20) -> list[Task]:
     """List all tasks, optionally filtered by status."""
     task_data_list = db_list(status)
@@ -1547,16 +1618,69 @@ def main():
     run_p.add_argument("--board-task-id", help="Agent Board task ID for binding")
     
     args = parser.parse_args()
-    
+
+    # Initialize database for all commands
+    init_db()
+
     if args.command == "list":
         tasks = list_tasks(status=args.status, limit=args.limit)
         if not tasks:
             print("No tasks found.")
             return
-        print(f"{'ID':<24} {'Name':<20} {'Status':<12} {'Elapsed':<10}")
-        print("-" * 70)
+
+        # Check for unmerged worktrees first and display prominent warning at top
+        unmerged_count, unmerged_tasks = get_unmerged_worktrees_summary(tasks)
+
+        # PROMINENT unmerged warning at the very top
+        if unmerged_count > 0:
+            print("=" * 80)
+            print(f"🚨 MERGE REQUIRED: {unmerged_count} unmerged completed task{'s' if unmerged_count != 1 else ''}")
+            print("   Code is in worktree branches but NOT in main branch!")
+            print("")
+            print("   To merge all:")
+            print(f"     rapper --merge-all")
+            print("")
+            print("   To merge individual tasks:")
+            for task, commit_count in unmerged_tasks[:3]:  # Show first 3 for brevity
+                print(f"     rapper --merge {task.id}  # {task.name}")
+            if len(unmerged_tasks) > 3:
+                print(f"     ... and {len(unmerged_tasks) - 3} more")
+            print("=" * 80)
+            print("")
+
+        # Display regular header
+        if unmerged_count > 0:
+            print(f"{'ID':<24} {'Name':<20} {'Status':<12} {'Elapsed':<10} {'Worktree':<15}")
+            print("-" * 85)
+        else:
+            print(f"{'ID':<24} {'Name':<20} {'Status':<12} {'Elapsed':<10}")
+            print("-" * 70)
+
+        # Create lookup for unmerged tasks
+        unmerged_lookup = {task.id: commit_count for task, commit_count in unmerged_tasks}
+
         for t in tasks:
-            print(f"{t.id:<24} {t.name[:20]:<20} {t.status:<12} {t.elapsed_str():<10}")
+            # Base task info
+            base_info = f"{t.id:<24} {t.name[:20]:<20} {t.status:<12} {t.elapsed_str():<10}"
+
+            # Add unmerged info if applicable
+            if t.id in unmerged_lookup:
+                commit_count = unmerged_lookup[t.id]
+                worktree_info = f"[unmerged: {commit_count} commit{'s' if commit_count != 1 else ''}]"
+                if unmerged_count > 0:
+                    print(f"{base_info} {worktree_info:<15}")
+                else:
+                    print(f"{base_info} {worktree_info}")
+            else:
+                print(base_info)
+
+        # Display actionable summary if there are unmerged worktrees
+        if unmerged_count > 0:
+            print("")
+            print("To merge worktrees:")
+            for task, commit_count in unmerged_tasks:
+                print(f"  rapper --merge {task.id}  # {task.name} ({task.branch_name})")
+            print(f"  rapper --merge-all        # Merge all {unmerged_count} unmerged worktrees")
     
     elif args.command == "status":
         task = get_task(args.task_id)
@@ -1633,6 +1757,9 @@ def main():
             sys.exit(1)
     
     elif args.command == "run":
+        # Initialize database first
+        init_db()
+
         # For CLI run, we need to daemonize properly
         # First fork detaches from parent
         task_id = generate_task_id()

@@ -313,6 +313,9 @@ class RapperDaemon:
         # Poll error backoff counter
         self._poll_error_count = 0
 
+        # Cleanup cycle tracking (for Pitfall #31 mitigation)
+        self._poll_cycle_count = 0
+
         # Thread pool for background task execution
         self.task_executor = ThreadPoolExecutor(
             max_workers=self.config.get('tasks', {}).get('max_concurrent_tasks', 5),
@@ -403,6 +406,23 @@ class RapperDaemon:
         except Exception as e:
             self.logger.warning(f"Failed to save picked task: {e}")
 
+    def _remove_from_picked_tasks(self, task_id: str):
+        """Remove task ID from picked_tasks file (immediate cleanup on completion)."""
+        try:
+            picked_tasks = self._load_picked_tasks()
+            if task_id in picked_tasks:
+                picked_tasks.remove(task_id)
+
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(self.picked_tasks_file), exist_ok=True)
+
+                with open(self.picked_tasks_file, 'w') as f:
+                    json.dump(list(picked_tasks), f)
+
+                self.logger.debug(f"Removed completed task {task_id} from picked_tasks file")
+        except Exception as e:
+            self.logger.warning(f"Failed to remove task from picked_tasks file: {e}")
+
     def _clear_old_picked_tasks(self):
         """Clear old picked tasks file (called at startup)."""
         try:
@@ -411,6 +431,41 @@ class RapperDaemon:
                 self.logger.info("Cleared old picked tasks deduplication file")
         except Exception as e:
             self.logger.warning(f"Failed to clear picked tasks file: {e}")
+
+    def _cleanup_completed_picked_tasks(self):
+        """Remove completed/failed task IDs from picked_tasks file to prevent bloat.
+
+        This is the fix for Pitfall #31: historical todo tasks blocking new pickup.
+        Query Board for terminal states and remove them from deduplication file.
+        """
+        try:
+            picked_tasks = self._load_picked_tasks()
+            if not picked_tasks:
+                return
+
+            original_count = len(picked_tasks)
+
+            # Query Board for tasks in terminal states (done, failed)
+            # These are safe to remove from picked_tasks since they won't be re-picked
+            done_tasks = self.client.get_tasks(None, 'done')
+            failed_tasks = self.client.get_tasks(None, 'failed')
+            terminal_task_ids = {t['id'] for t in done_tasks + failed_tasks}
+
+            # Remove terminal task IDs from picked_tasks
+            cleaned_picked_tasks = picked_tasks - terminal_task_ids
+            removed_count = original_count - len(cleaned_picked_tasks)
+
+            if removed_count > 0:
+                # Save cleaned picked_tasks back to file
+                with open(self.picked_tasks_file, 'w') as f:
+                    json.dump(list(cleaned_picked_tasks), f)
+                self.logger.info(f"Cleaned {removed_count} completed tasks from picked_tasks file "
+                               f"({original_count} → {len(cleaned_picked_tasks)})")
+            else:
+                self.logger.debug(f"No cleanup needed for picked_tasks file ({original_count} entries)")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to cleanup picked tasks file: {e}")
 
     def _start_webhook_server(self):
         """Start webhook HTTP server in background thread."""
@@ -485,6 +540,14 @@ class RapperDaemon:
     def _poll_and_execute_tasks(self):
         """Poll for tasks and execute them."""
         try:
+            # Increment poll cycle counter
+            self._poll_cycle_count += 1
+
+            # Periodic cleanup of completed tasks from picked_tasks file (Pitfall #31 fix)
+            # Run every 10 poll cycles to prevent picked_tasks bloat without excessive API calls
+            if self._poll_cycle_count % 10 == 0:
+                self._cleanup_completed_picked_tasks()
+
             # Log polling activity to show daemon is responsive even during task execution
             with self.running_tasks_lock:
                 active_tasks = len(self.running_task_futures)
@@ -670,6 +733,9 @@ class RapperDaemon:
                 except Exception as e:
                     self.logger.warning(f"Failed to post failure comment: {e}")
 
+            # Immediate cleanup: remove completed task from picked_tasks file (Pitfall #31 mitigation)
+            self._remove_from_picked_tasks(board_task_id)
+
         except Exception as e:
             self.logger.error(f"Error executing task {board_task_id}: {e}")
             error_msg = f"Execution error: {e}"
@@ -685,6 +751,9 @@ class RapperDaemon:
                 self.client.add_comment(board_task_id, self.agent_id, text)
             except Exception as ce:
                 self.logger.warning(f"Failed to post failure comment: {ce}")
+
+            # Immediate cleanup for failed tasks too (Pitfall #31 mitigation)
+            self._remove_from_picked_tasks(board_task_id)
 
         finally:
             # Clear current task if it was ours

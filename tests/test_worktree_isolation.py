@@ -322,6 +322,86 @@ def test_auto_commit_worktree_invalid_path():
     print("✓ test_auto_commit_worktree_invalid_path passed")
 
 
+def test_auto_commit_worktree_includes_untracked_files():
+    """
+    [TEST-SUPP-001] Test that auto_commit_worktree commits untracked NEW files.
+
+    CRITICAL: This test verifies the bug where `git add -u` fails to include
+    newly created untracked files, requiring `git add -A` instead.
+
+    If this test PASSES with current code, the test is invalid.
+    This test should FAIL if code uses `git add -u` and PASS with `git add -A`.
+    """
+    repo_dir, wt_dir = _make_test_git_repo()
+
+    try:
+        # Create a NEW untracked file in the worktree (simulating Claude creating new files)
+        new_file = os.path.join(wt_dir, "new_feature.py")
+        with open(new_file, "w") as f:
+            f.write("# New file created by Claude\ndef new_function():\n    return 'implemented'\n")
+
+        # Also modify an existing file to test both scenarios
+        test_file = os.path.join(wt_dir, "test.txt")
+        with open(test_file, "w") as f:
+            f.write("modified by claude\n")
+
+        # Verify we have both modified and untracked files
+        result = subprocess.run(["git", "-C", wt_dir, "status", "--porcelain"],
+                                capture_output=True, text=True)
+        status_lines = result.stdout.strip().split('\n')
+
+        # Should have one modified file (M) and one untracked file (??)
+        # Git status porcelain format: " M file.txt" for modified, "?? file.txt" for untracked
+        modified_files = [line for line in status_lines if line.startswith(' M') or 'M ' in line]
+        untracked_files = [line for line in status_lines if line.startswith('??')]
+
+        assert len(modified_files) == 1, f"Expected 1 modified file, got {len(modified_files)}: {modified_files}"
+        assert len(untracked_files) == 1, f"Expected 1 untracked file, got {len(untracked_files)}: {untracked_files}"
+        assert "new_feature.py" in untracked_files[0], f"Untracked file should be new_feature.py: {untracked_files[0]}"
+
+        # Create a mock Task
+        task = Task(
+            id="test-untracked",
+            name="test-untracked-files",
+            prompt="test untracked behavior",
+            workdir=wt_dir,
+            worktree_path=wt_dir,
+            branch_name="rapper/test-untracked",
+        )
+
+        # Run auto_commit_worktree
+        success = auto_commit_worktree(task)
+        assert success, "auto_commit_worktree should return True on success"
+
+        # Verify the worktree is now clean (both modified and untracked files committed)
+        result = subprocess.run(["git", "-C", wt_dir, "status", "--porcelain"],
+                                capture_output=True, text=True)
+        assert not result.stdout.strip(), f"Worktree should be clean after auto_commit, but got: {result.stdout}"
+
+        # Verify the new untracked file is now tracked and committed
+        result = subprocess.run(["git", "-C", wt_dir, "ls-files", "new_feature.py"],
+                                capture_output=True, text=True)
+        assert result.stdout.strip() == "new_feature.py", f"new_feature.py should be tracked after commit: {result.stdout}"
+
+        # Verify a new commit was created
+        result = subprocess.run(["git", "-C", wt_dir, "rev-list", "--count", "HEAD"],
+                                capture_output=True, text=True)
+        assert result.stdout.strip() == "2", "Should have 2 commits after auto_commit"
+
+        # Verify the commit contains both files
+        result = subprocess.run(["git", "-C", wt_dir, "diff", "--name-only", "HEAD~1", "HEAD"],
+                                capture_output=True, text=True)
+        committed_files = result.stdout.strip().split('\n')
+        assert "test.txt" in committed_files, f"Modified file should be in commit: {committed_files}"
+        assert "new_feature.py" in committed_files, f"Untracked file should be in commit: {committed_files}"
+
+        print("✓ test_auto_commit_worktree_includes_untracked_files passed")
+
+    finally:
+        import shutil
+        shutil.rmtree(os.path.dirname(os.path.dirname(wt_dir)), ignore_errors=True)
+
+
 if __name__ == "__main__":
     """Run all tests."""
     print("Running worktree isolation tests...\n")
@@ -338,6 +418,7 @@ if __name__ == "__main__":
         test_auto_commit_worktree_commits_changes()
         test_auto_commit_worktree_clean_is_noop()
         test_auto_commit_worktree_invalid_path()
+        test_auto_commit_worktree_includes_untracked_files()
 
         print("\n🎉 All worktree isolation tests passed!")
 

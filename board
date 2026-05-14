@@ -3,12 +3,14 @@
 Board CLI - Command-line interface for Agent Board tools.
 
 Usage:
+    board create <title> <description> [--workdir=PATH] [--assignee=USER] [--priority=P]
     board move <task_id> <column>        Move task to column
     board comment <task_id> <text>       Add comment to task
     board get <task_id>                  Get task details
     board my [status] [limit]            List my tasks
 
 Examples:
+    board create "Fix auth bug" "Fix authentication issue" --workdir=/app/agent-board/repo
     board move task_abc123 doing
     board comment task_abc123 "Started working on this"
     board get task_abc123
@@ -23,7 +25,7 @@ lib_dir = os.path.join(os.path.dirname(__file__), 'lib')
 sys.path.insert(0, lib_dir)
 
 try:
-    from board_tools import board_move_task, board_add_comment, board_get_task, board_my_tasks
+    from board_tools import board_move_task, board_add_comment, board_get_task, board_my_tasks, board_create_task
 except ImportError as e:
     print(f"Error: Failed to import board tools: {e}")
     sys.exit(1)
@@ -37,7 +39,31 @@ def main():
     command = sys.argv[1].lower()
 
     try:
-        if command == "move":
+        if command == "create":
+            if len(sys.argv) < 4:
+                print("Usage: board create <title> <description> [--workdir=PATH] [--assignee=USER] [--priority=P]")
+                sys.exit(1)
+
+            title = sys.argv[2]
+            description = sys.argv[3]
+
+            # Parse optional arguments
+            workdir = None
+            assignee = None
+            priority = "normal"
+
+            for arg in sys.argv[4:]:
+                if arg.startswith("--workdir="):
+                    workdir = arg.split("=", 1)[1]
+                elif arg.startswith("--assignee="):
+                    assignee = arg.split("=", 1)[1]
+                elif arg.startswith("--priority="):
+                    priority = arg.split("=", 1)[1]
+
+            result = board_create_task(title, description, assignee=assignee, workdir=workdir, priority=priority)
+            print(result)
+
+        elif command == "move":
             if len(sys.argv) != 4:
                 print("Usage: board move <task_id> <column>")
                 sys.exit(1)
