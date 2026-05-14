@@ -22,6 +22,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -312,6 +313,16 @@ class RapperDaemon:
         # Poll error backoff counter
         self._poll_error_count = 0
 
+        # Thread pool for background task execution
+        self.task_executor = ThreadPoolExecutor(
+            max_workers=self.config.get('tasks', {}).get('max_concurrent_tasks', 5),
+            thread_name_prefix="task-executor"
+        )
+
+        # Track running task futures to prevent blocking the main polling loop
+        self.running_task_futures: Dict[str, Future] = {}
+        self.running_tasks_lock = threading.Lock()
+
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from YAML file."""
         with open(self.config_path, 'r') as f:
@@ -474,6 +485,12 @@ class RapperDaemon:
     def _poll_and_execute_tasks(self):
         """Poll for tasks and execute them."""
         try:
+            # Log polling activity to show daemon is responsive even during task execution
+            with self.running_tasks_lock:
+                active_tasks = len(self.running_task_futures)
+            if active_tasks > 0:
+                self.logger.debug(f"Polling for new tasks ({active_tasks} currently executing in background)")
+
             # Query both todo and ready columns for comprehensive task pickup
             # This allows daemon to pickup both manually assigned (todo) and auto-promoted (ready) tasks
             all_todo_tasks = self.client.get_tasks(None, 'todo')
@@ -529,18 +546,26 @@ class RapperDaemon:
                 return
 
             # Check concurrency limit before processing tasks
-            running_count = self._count_running_tasks()
+            # Count both SQLite running tasks and our thread pool futures
+            with self.running_tasks_lock:
+                thread_pool_running = len(self.running_task_futures)
+            sqlite_running_count = self._count_running_tasks()
+            total_running = max(sqlite_running_count, thread_pool_running)  # Use max for safety
+
             max_concurrent = self.config.get('tasks', {}).get('max_concurrent_tasks', 5)
 
-            if running_count >= max_concurrent:
-                self.logger.warning(f"Concurrency limit reached: {running_count}/{max_concurrent}, skipping task execution")
+            if total_running >= max_concurrent:
+                self.logger.warning(f"Concurrency limit reached: {total_running}/{max_concurrent} (SQLite: {sqlite_running_count}, threads: {thread_pool_running}), skipping task execution")
                 return
+
+            # Clean up completed futures before starting new task
+            self._cleanup_completed_futures()
 
             # Process first available task
             board_task = available_tasks[0]
             task_id = board_task['id']
 
-            self.logger.info(f"Picked task: {task_id} (current load: {running_count}/{max_concurrent})")
+            self.logger.info(f"Picked task: {task_id} (current load: {total_running}/{max_concurrent})")
 
             # ── Method A: Claim task on the board BEFORE execution ────────────────
             # Move todo → doing immediately so the next poll never sees it again,
@@ -572,78 +597,123 @@ class RapperDaemon:
                 board_task_id=task_id
             )
 
-            self.current_task = (task_id, internal_task)
-            self._last_progress_step = 0  # Reset progress tracking for new task
+            # Submit task execution to background thread instead of blocking
+            future = self.task_executor.submit(self._execute_task_in_background, task_id, internal_task)
 
-            try:
-                # Start heartbeat thread to periodically update task status during execution
-                heartbeat_stop_event = threading.Event()
-                heartbeat_thread = threading.Thread(
-                    target=self._heartbeat_worker,
-                    args=(task_id, heartbeat_stop_event),
-                    daemon=True
-                )
-                heartbeat_thread.start()
+            # Track the future
+            with self.running_tasks_lock:
+                self.running_task_futures[task_id] = future
 
-                start_time = time.time()  # BUG-P14: record start time for elapsed calculation
-                try:
-                    # Execute task synchronously
-                    self.logger.info(f"Executing task: {internal_task.id}")
-                    self.task_runner._run_task_sync(internal_task, timeout=3600, max_turns=200)
-                finally:
-                    # Stop heartbeat thread
-                    heartbeat_stop_event.set()
-                    heartbeat_thread.join(timeout=5)
+            self.logger.info(f"Task {task_id} submitted to background executor (internal_task: {internal_task.id})")
 
-                # Check result
-                if internal_task.status == 'completed':
-                    self.client.update_task_status(task_id, 'done', internal_task.result or 'Task completed successfully')
-                    self.logger.info(f"Task {task_id} completed successfully")
-                    # BUG-P14: Post terminal completion comment
-                    elapsed = int(time.time() - start_time)
-                    steps = len(getattr(internal_task, 'progress', []) or [])
-                    sr = getattr(internal_task, 'structured_result', None) or {}
-                    output_path = sr.get('output_path', '') if isinstance(sr, dict) else ''
-                    text = f"✅ 任务完成\n耗时：{elapsed}s | 步数：{steps}"
-                    if output_path:
-                        text += f"\n输出：{output_path}"
-                    try:
-                        self.client.add_comment(task_id, self.agent_id, text)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to post completion comment: {e}")
-                else:
-                    error_msg = internal_task.error or 'Task failed for unknown reason'
-                    self.client.update_task_status(task_id, 'failed', error_msg)
-                    self.logger.error(f"Task {task_id} failed: {error_msg}")
-                    # BUG-P14: Post terminal failure comment
-                    elapsed = int(time.time() - start_time)
-                    steps = len(getattr(internal_task, 'progress', []) or [])
-                    text = f"❌ 任务失败\n耗时：{elapsed}s | 步数：{steps}\n原因：{error_msg[:300]}"
-                    try:
-                        self.client.add_comment(task_id, self.agent_id, text)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to post failure comment: {e}")
-
-            except Exception as e:
-                self.logger.error(f"Error executing task {task_id}: {e}")
-                error_msg = f"Execution error: {e}"
-                self.client.update_task_status(task_id, 'failed', error_msg)
-                # BUG-P14: Post terminal failure comment for exception path
-                try:
-                    elapsed = int(time.time() - start_time)
-                    steps = len(getattr(internal_task, 'progress', []) or [])
-                    text = f"❌ 任务失败\n耗时：{elapsed}s | 步数：{steps}\n原因：{str(e)[:300]}"
-                    self.client.add_comment(task_id, self.agent_id, text)
-                except Exception as ce:
-                    self.logger.warning(f"Failed to post failure comment: {ce}")
-
-            finally:
-                self.current_task = None
-                self._last_progress_step = 0  # Reset progress tracking
-
+        except (HTTPError, URLError) as e:
+            self._poll_error_count += 1
+            with self.running_tasks_lock:
+                active_tasks = len(self.running_task_futures)
+            self.logger.warning(f'Agent Board connection error (attempt {self._poll_error_count}, {active_tasks} tasks running): {e}')
         except Exception as e:
             self._poll_error_count += 1
             self.logger.error(f'Error in task polling (attempt {self._poll_error_count}): {e}')
+
+    def _execute_task_in_background(self, board_task_id: str, internal_task: Task):
+        """Execute a task in background thread to avoid blocking the main polling loop."""
+        try:
+            # Set current task for heartbeat tracking
+            self.current_task = (board_task_id, internal_task)
+            self._last_progress_step = 0  # Reset progress tracking for new task
+
+            # Start heartbeat thread to periodically update task status during execution
+            heartbeat_stop_event = threading.Event()
+            heartbeat_thread = threading.Thread(
+                target=self._heartbeat_worker,
+                args=(board_task_id, heartbeat_stop_event),
+                daemon=True
+            )
+            heartbeat_thread.start()
+
+            start_time = time.time()  # BUG-P14: record start time for elapsed calculation
+            try:
+                # Execute task synchronously within background thread
+                self.logger.info(f"Executing task: {internal_task.id} (board: {board_task_id})")
+                self.task_runner._run_task_sync(internal_task, timeout=3600, max_turns=200)
+            finally:
+                # Stop heartbeat thread
+                heartbeat_stop_event.set()
+                heartbeat_thread.join(timeout=5)
+
+            # Check result and update board
+            if internal_task.status == 'completed':
+                self.client.update_task_status(board_task_id, 'done', internal_task.result or 'Task completed successfully')
+                self.logger.info(f"Task {board_task_id} completed successfully")
+                # BUG-P14: Post terminal completion comment
+                elapsed = int(time.time() - start_time)
+                steps = len(getattr(internal_task, 'progress', []) or [])
+                sr = getattr(internal_task, 'structured_result', None) or {}
+                output_path = sr.get('output_path', '') if isinstance(sr, dict) else ''
+                text = f"✅ 任务完成\n耗时：{elapsed}s | 步数：{steps}"
+                if output_path:
+                    text += f"\n输出：{output_path}"
+                try:
+                    self.client.add_comment(board_task_id, self.agent_id, text)
+                except Exception as e:
+                    self.logger.warning(f"Failed to post completion comment: {e}")
+            else:
+                error_msg = internal_task.error or 'Task failed for unknown reason'
+                self.client.update_task_status(board_task_id, 'failed', error_msg)
+                self.logger.error(f"Task {board_task_id} failed: {error_msg}")
+                # BUG-P14: Post terminal failure comment
+                elapsed = int(time.time() - start_time)
+                steps = len(getattr(internal_task, 'progress', []) or [])
+                text = f"❌ 任务失败\n耗时：{elapsed}s | 步数：{steps}\n原因：{error_msg[:300]}"
+                try:
+                    self.client.add_comment(board_task_id, self.agent_id, text)
+                except Exception as e:
+                    self.logger.warning(f"Failed to post failure comment: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error executing task {board_task_id}: {e}")
+            error_msg = f"Execution error: {e}"
+            try:
+                self.client.update_task_status(board_task_id, 'failed', error_msg)
+            except Exception:
+                pass  # Ignore board update errors during cleanup
+            # BUG-P14: Post terminal failure comment for exception path
+            try:
+                elapsed = int(time.time() - start_time) if 'start_time' in locals() else 0
+                steps = len(getattr(internal_task, 'progress', []) or [])
+                text = f"❌ 任务失败\n耗时：{elapsed}s | 步数：{steps}\n原因：{str(e)[:300]}"
+                self.client.add_comment(board_task_id, self.agent_id, text)
+            except Exception as ce:
+                self.logger.warning(f"Failed to post failure comment: {ce}")
+
+        finally:
+            # Clear current task if it was ours
+            if self.current_task and self.current_task[0] == board_task_id:
+                self.current_task = None
+                self._last_progress_step = 0  # Reset progress tracking
+
+            # Remove from futures tracking
+            with self.running_tasks_lock:
+                self.running_task_futures.pop(board_task_id, None)
+
+    def _cleanup_completed_futures(self):
+        """Remove completed futures from tracking dict."""
+        with self.running_tasks_lock:
+            completed_tasks = []
+            for task_id, future in self.running_task_futures.items():
+                if future.done():
+                    completed_tasks.append(task_id)
+
+            for task_id in completed_tasks:
+                future = self.running_task_futures.pop(task_id)
+                # Log any exceptions from completed tasks
+                try:
+                    future.result()  # This will raise if the task failed
+                except Exception as e:
+                    self.logger.warning(f"Background task {task_id} completed with exception: {e}")
+
+            if completed_tasks:
+                self.logger.debug(f"Cleaned up {len(completed_tasks)} completed task futures")
 
     def _heartbeat_worker(self, task_id: str, stop_event: threading.Event):
         """Background worker to send periodic heartbeat updates for a task."""
@@ -762,6 +832,20 @@ class RapperDaemon:
             except Exception as e:
                 self.logger.error(f"Failed to mark task as failed: {e}")
 
+        # Mark any other running tasks in thread pool as failed
+        with self.running_tasks_lock:
+            for task_id, future in list(self.running_task_futures.items()):
+                if not future.done():
+                    try:
+                        self.client.update_task_status(
+                            task_id,
+                            'failed',
+                            'Task interrupted by agent shutdown'
+                        )
+                        self.logger.info(f"Marked background task {task_id} as failed due to shutdown")
+                    except Exception as e:
+                        self.logger.error(f"Failed to mark background task {task_id} as failed: {e}")
+
         self.shutdown()
 
     def start(self):
@@ -820,6 +904,21 @@ class RapperDaemon:
     def _cleanup(self):
         """Cleanup resources."""
         self.logger.info("Cleaning up...")
+
+        # Shutdown task executor and wait for running tasks
+        if hasattr(self, 'task_executor'):
+            self.logger.info("Shutting down task executor...")
+            # Cancel any remaining futures
+            with self.running_tasks_lock:
+                for task_id, future in self.running_task_futures.items():
+                    if not future.done():
+                        self.logger.warning(f"Cancelling running task {task_id}")
+                        future.cancel()
+
+            # Shutdown executor and wait for tasks to finish
+            self.task_executor.shutdown(wait=True)
+            self.logger.info("Task executor shut down")
+
         self._stop_webhook_server()
         self._unregister_from_agent_board()
         self.logger.info("Daemon stopped")
