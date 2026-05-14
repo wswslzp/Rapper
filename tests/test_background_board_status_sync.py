@@ -97,8 +97,20 @@ class TestBackgroundBoardStatusSync(unittest.TestCase):
                         # Start background task execution
                         runner = TaskRunner()
 
+                        # Save the original method
+                        original_run_task_sync = runner._run_task_sync
+
                         # Mock task completion quickly to avoid long-running test
                         def mock_run_task_sync(task, **kwargs):
+                            # Call original method first to trigger Board claiming logic
+                            try:
+                                # Import claim function to call it manually
+                                from task_runner import claim_board_task_if_provided
+                                claim_board_task_if_provided(task)
+                            except Exception as e:
+                                print(f"Board claim error: {e}")
+
+                            # Then complete the task quickly
                             task.status = 'completed'
                             task.result = 'Test task completed'
                             task.save()

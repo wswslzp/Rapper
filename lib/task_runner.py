@@ -41,6 +41,69 @@ TASK_DIR = Path(os.path.expanduser("~/.rapper/tasks"))
 TASK_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def claim_board_task_if_provided(task: "Task") -> bool:
+    """Claim a Board task by moving it to 'doing' status if board_task_id is set.
+
+    This ensures the task is atomically moved from todo→doing when --background starts,
+    eliminating the forgetting window where Hermes creates but doesn't move the task.
+
+    Args:
+        task: Task object with optional board_task_id
+
+    Returns:
+        True if claiming was successful or not needed, False if claim failed
+    """
+    if not task.board_task_id:
+        return True  # No board task to claim, success
+
+    try:
+        # Import AgentBoardClient locally to avoid circular imports
+        import sys, os
+        daemon_path = os.path.join(os.path.dirname(__file__), 'daemon.py')
+        if not os.path.exists(daemon_path):
+            print(f"[rapper/claim] WARNING: daemon.py not found, cannot claim board task {task.board_task_id}", file=sys.stderr)
+            return False
+
+        # Import AgentBoardClient from daemon module
+        sys.path.insert(0, os.path.dirname(__file__))
+        try:
+            from daemon import AgentBoardClient
+        except ImportError as e:
+            print(f"[rapper/claim] WARNING: Failed to import AgentBoardClient: {e}", file=sys.stderr)
+            return False
+
+        # Load config to get Board API details
+        config = load_config()
+        board_config = config.get('agent_board', {})
+
+        if not board_config.get('url'):
+            print(f"[rapper/claim] WARNING: No agent_board.url in config, cannot claim board task {task.board_task_id}", file=sys.stderr)
+            return False
+
+        # Create client and claim task
+        client = AgentBoardClient(
+            board_config['url'],
+            board_config.get('api_key')
+        )
+
+        # Use configured agent_id or default
+        agent_id = board_config.get('agent_id', 'rapper-1')
+
+        print(f"[rapper/claim] Claiming board task {task.board_task_id} → doing", file=sys.stderr)
+        success = client.claim_task(task.board_task_id, agent_id)
+
+        if success:
+            print(f"[rapper/claim] Successfully claimed board task {task.board_task_id}", file=sys.stderr)
+            return True
+        else:
+            print(f"[rapper/claim] WARNING: Failed to claim board task {task.board_task_id} (network/API error)", file=sys.stderr)
+            return False
+
+    except Exception as e:
+        print(f"[rapper/claim] WARNING: Exception claiming board task {task.board_task_id}: {e}", file=sys.stderr)
+        return False
+
+
 @dataclass
 class Task:
     """Represents a background Claude task."""
@@ -65,6 +128,7 @@ class Task:
     repo_workdir: str | None = None       # 主 repo 路径（worktree 模式下与 workdir 不同）
     claude_version: str | None = None     # Claude Code version when task started
     board_task_id: str | None = None      # Agent Board task ID (e.g., task_7f25a48f)
+    auto_merge: bool = False              # Whether to automatically merge worktree on completion
     progress: list[dict] = field(default_factory=list)  # tool calls
     created_at: str | None = None         # ISO timestamp when task was first created
     completed_at: str | None = None       # ISO timestamp when task reached terminal status
@@ -122,6 +186,7 @@ class Task:
             "repo_workdir": self.repo_workdir,
             "claude_version": self.claude_version,
             "board_task_id": self.board_task_id,
+            "auto_merge": self.auto_merge,
             "progress": self.progress[-20:],  # Keep last 20 tool calls
             "created_at": self.created_at,
             "completed_at": self.completed_at,
@@ -158,6 +223,7 @@ class Task:
                 repo_workdir=data.get("repo_workdir"),
                 claude_version=data.get("claude_version"),
                 board_task_id=data.get("board_task_id"),
+                auto_merge=data.get("auto_merge", False),
                 progress=data.get("progress", []),
                 created_at=data.get("created_at"),
                 completed_at=data.get("completed_at"),
@@ -824,6 +890,138 @@ def remove_worktree(worktree_path: str, workdir: str) -> bool:
         return False
 
 
+def auto_merge_worktree(task: Task) -> bool:
+    """Automatically merge and cleanup a worktree after successful task completion.
+
+    Returns True if merge was successful, False otherwise.
+    """
+    if not task.worktree_path or not task.branch_name or not task.repo_workdir:
+        print(f"[rapper/auto-merge] ERROR: task {task.id} missing worktree data", file=sys.stderr)
+        return False
+
+    if not os.path.exists(task.worktree_path):
+        print(f"[rapper/auto-merge] ERROR: worktree path does not exist: {task.worktree_path}", file=sys.stderr)
+        return False
+
+    try:
+        # Use repo_workdir (original main repo) for merge target
+        merge_target = task.repo_workdir
+
+        # Check for uncommitted changes in main branch and handle them
+        main_dirty_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=merge_target,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        main_dirty = main_dirty_result.stdout.strip()
+
+        stash_created = False
+        if main_dirty:
+            # Handle __pycache__ files by discarding them
+            pycache_files = [line.split(None, 1)[1] for line in main_dirty.split('\n')
+                           if line and '__pycache__' in line]
+            for file in pycache_files:
+                subprocess.run(
+                    ["git", "checkout", "--", file],
+                    cwd=merge_target,
+                    capture_output=True,
+                    timeout=10
+                )
+
+            # Stash other changes
+            remaining_dirty = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=merge_target,
+                capture_output=True,
+                text=True,
+                timeout=10
+            ).stdout.strip()
+
+            if remaining_dirty:
+                stash_msg = f"rapper-auto-merge-{int(time.time())}: pre-merge stash for task {task.id}"
+                stash_result = subprocess.run(
+                    ["git", "stash", "push", "-m", stash_msg],
+                    cwd=merge_target,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if stash_result.returncode == 0:
+                    stash_created = True
+                    print(f"[rapper/auto-merge] stashed uncommitted changes: {stash_msg}", file=sys.stderr)
+
+        # Perform the merge
+        merge_result = subprocess.run(
+            ["git", "merge", task.branch_name],
+            cwd=merge_target,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if merge_result.returncode == 0:
+            # Merge succeeded
+            print(f"[rapper/auto-merge] merged {task.branch_name} successfully", file=sys.stderr)
+
+            # Remove the worktree
+            remove_result = subprocess.run(
+                ["git", "worktree", "remove", task.worktree_path, "--force"],
+                cwd=merge_target,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if remove_result.returncode == 0:
+                print(f"[rapper/auto-merge] removed worktree: {task.worktree_path}", file=sys.stderr)
+
+            # Delete the branch
+            branch_result = subprocess.run(
+                ["git", "branch", "-d", task.branch_name],
+                cwd=merge_target,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if branch_result.returncode == 0:
+                print(f"[rapper/auto-merge] deleted branch: {task.branch_name}", file=sys.stderr)
+
+            # Restore stashed changes if any
+            if stash_created:
+                stash_pop_result = subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=merge_target,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if stash_pop_result.returncode == 0:
+                    print(f"[rapper/auto-merge] restored stashed changes", file=sys.stderr)
+                else:
+                    print(f"[rapper/auto-merge] WARNING: could not restore stashed changes", file=sys.stderr)
+
+            return True
+        else:
+            # Merge failed
+            print(f"[rapper/auto-merge] merge failed: {merge_result.stderr}", file=sys.stderr)
+
+            # Restore stashed changes on failure
+            if stash_created:
+                subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=merge_target,
+                    capture_output=True,
+                    timeout=30
+                )
+
+            return False
+
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as e:
+        print(f"[rapper/auto-merge] ERROR: {e}", file=sys.stderr)
+        return False
+
+
 def check_worktree_unmerged(task: Task) -> tuple[bool, int]:
     """Check if a task's worktree has unmerged commits.
 
@@ -923,6 +1121,7 @@ def list_tasks(status: str | None = None, limit: int = 20) -> list[Task]:
                 repo_workdir=data.get("repo_workdir"),
                 claude_version=data.get("claude_version"),
                 board_task_id=data.get("board_task_id"),
+                auto_merge=data.get("auto_merge", False),
                 progress=data.get("progress", []),
                 created_at=data.get("created_at"),
                 completed_at=data.get("completed_at"),
@@ -1063,7 +1262,13 @@ class TaskRunner:
             board_task_id=board_task_id,
         )
         task.save()
-        
+
+        # Claim Board task if provided (atomically move todo→doing before execution)
+        claim_success = claim_board_task_if_provided(task)
+        if not claim_success:
+            # Log warning but continue - this is non-fatal for background task execution
+            pass
+
         # Build command
         cmd = [
             self.claude_path,
@@ -1246,6 +1451,17 @@ class TaskRunner:
                     # Auto-commit worktree changes so branch has a proper commit for --merge
                     if task.worktree_path:
                         auto_commit_worktree(task)
+                        # Auto-merge if enabled and task completed successfully
+                        if task.auto_merge:
+                            try:
+                                print(f"[rapper/auto-merge] task {task.id}: auto-merging completed task", file=sys.stderr)
+                                success = auto_merge_worktree(task)
+                                if success:
+                                    print(f"[rapper/auto-merge] task {task.id}: successfully merged and cleaned up", file=sys.stderr)
+                                else:
+                                    print(f"[rapper/auto-merge] task {task.id}: merge failed - requires manual intervention", file=sys.stderr)
+                            except Exception as e:
+                                print(f"[rapper/auto-merge] task {task.id}: auto-merge error: {e}", file=sys.stderr)
                 else:
                     task.status = "failed"
                     task.error = task.error or f"Exit code {proc.returncode}"
@@ -1331,6 +1547,12 @@ class TaskRunner:
     
     def _run_task_sync(self, task: Task, timeout: int = 3600, max_turns: int = 200):
         """Run a task synchronously (for daemon process)."""
+        # Claim Board task if provided (atomically move todo→doing before execution)
+        claim_success = claim_board_task_if_provided(task)
+        if not claim_success:
+            # Log warning but continue - this is non-fatal for task execution
+            pass
+
         model = self.default_model
         
         # Build command
@@ -1483,6 +1705,17 @@ class TaskRunner:
                     # Auto-commit worktree changes so branch has a proper commit for --merge
                     if task.worktree_path:
                         auto_commit_worktree(task)
+                        # Auto-merge if enabled and task completed successfully
+                        if task.auto_merge:
+                            try:
+                                print(f"[rapper/auto-merge] task {task.id}: auto-merging completed task", file=sys.stderr)
+                                success = auto_merge_worktree(task)
+                                if success:
+                                    print(f"[rapper/auto-merge] task {task.id}: successfully merged and cleaned up", file=sys.stderr)
+                                else:
+                                    print(f"[rapper/auto-merge] task {task.id}: merge failed - requires manual intervention", file=sys.stderr)
+                            except Exception as e:
+                                print(f"[rapper/auto-merge] task {task.id}: auto-merge error: {e}", file=sys.stderr)
                 else:
                     task.status = "failed"
                     task.error = task.error or f"Exit code {proc.returncode}"
@@ -1614,6 +1847,7 @@ def main():
     run_p.add_argument("--budget", type=float, help="Budget cap in USD")
     run_p.add_argument("--fallback", help="Fallback model on overload")
     run_p.add_argument("--worktree", action="store_true", help="Use git worktree isolation")
+    run_p.add_argument("--auto-merge", action="store_true", help="Automatically merge worktree on successful completion")
     run_p.add_argument("--max-turns", type=int, default=200, dest="max_turns", help="Maximum Claude turns (default: 200)")
     run_p.add_argument("--board-task-id", help="Agent Board task ID for binding")
     
@@ -1697,6 +1931,18 @@ def main():
             print(f"Worktree: {task.worktree_path}")
         if task.branch_name:
             print(f"Branch:   {task.branch_name}")
+
+        # Check for unmerged status and display prominently
+        if task.status in ["completed", "failed"] and task.worktree_path:
+            is_unmerged, commit_count = check_worktree_unmerged(task)
+            if is_unmerged:
+                print("")
+                print("🚨 MERGE REQUIRED:")
+                print(f"   This task has {commit_count} unmerged commit{'s' if commit_count != 1 else ''}")
+                print(f"   Code is in worktree branch '{task.branch_name}' but NOT in main branch!")
+                print(f"   Run: rapper --merge {task.id}")
+                print("")
+
         print(f"Elapsed: {task.elapsed_str()}")
         if task.pid:
             print(f"PID:     {task.pid}")
@@ -1797,13 +2043,19 @@ def main():
             branch_name=branch_name,
             repo_workdir=repo_workdir,
             board_task_id=getattr(args, 'board_task_id', None),
+            auto_merge=getattr(args, 'auto_merge', False),
         )
         task.save()
-        
+
+        # Claim Board task if provided (atomically move todo→doing before execution)
+        claim_success = claim_board_task_if_provided(task)
+        if not claim_success:
+            print(f"[rapper] Warning: Failed to claim board task {task.board_task_id}, proceeding anyway", file=sys.stderr)
+
         print(f"Started task: {task.id}")
         print(f"Status: {task.status}")
         print(f"Log: {task.log_file}")
-        
+
         # Double-fork to daemonize
         pid = os.fork()
         if pid > 0:
