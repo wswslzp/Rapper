@@ -975,7 +975,7 @@ do_background() {
     done
 
     if [[ -z "$prompt" ]]; then
-        log_error "Usage: rapper --background <name> -p 'prompt' [-w/--workdir <path>] [--worktree] [--budget <usd>] [--fallback <model>] [--max-turns <n>] [--board-task-id <id>]"
+        log_error "Usage: rapper --background <name> -p 'prompt' [-w/--workdir <path>] [--worktree] [--auto-merge] [--budget <usd>] [--fallback <model>] [--max-turns <n>] [--board-task-id <id>]"
         exit 1
     fi
 
@@ -1219,6 +1219,7 @@ TMUX SESSIONS (interactive):
 BACKGROUND TASKS (autonomous):
     rapper --background <name> -p "task" --workdir /path  # Start background task
     rapper --background <name> --worktree -p "task" --workdir /project  # Isolated git worktree
+    rapper --background <name> --worktree --auto-merge -p "task" --workdir /project  # Auto-merge on success
     rapper --background <name> --board-task-id task_xyz -p "task"  # Bind to Agent Board task
     rapper --tasks [status]                # List tasks
     rapper --task-count                    # Get count of running tasks (for concurrency control)

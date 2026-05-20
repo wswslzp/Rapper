@@ -41,7 +41,7 @@ TASK_DIR = Path(os.path.expanduser("~/.rapper/tasks"))
 TASK_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def claim_board_task_if_provided(task: "Task") -> bool:
+def claim_board_task_if_provided(task: "Task", config: dict = None) -> bool:
     """Claim a Board task by moving it to 'doing' status if board_task_id is set.
 
     This ensures the task is atomically moved from todo→doing when --background starts,
@@ -49,6 +49,7 @@ def claim_board_task_if_provided(task: "Task") -> bool:
 
     Args:
         task: Task object with optional board_task_id
+        config: Optional config dict to use instead of loading from default location
 
     Returns:
         True if claiming was successful or not needed, False if claim failed
@@ -72,9 +73,16 @@ def claim_board_task_if_provided(task: "Task") -> bool:
             print(f"[rapper/claim] WARNING: Failed to import AgentBoardClient: {e}", file=sys.stderr)
             return False
 
-        # Load config to get Board API details
-        config = load_config()
+        # Load config to get Board API details (use provided config or load default)
+        if config is None:
+            config = load_config()
         board_config = config.get('agent_board', {})
+
+        # Skip claim if in daemon context (daemon already claimed externally)
+        env_daemon = os.environ.get('RAPPER_DAEMON_CONTEXT') == '1'
+        config_daemon = board_config.get('role') in ['reviewer', 'daemon']
+        if env_daemon or config_daemon:
+            return True  # Skip duplicate claim in daemon context
 
         if not board_config.get('url'):
             print(f"[rapper/claim] WARNING: No agent_board.url in config, cannot claim board task {task.board_task_id}", file=sys.stderr)
@@ -289,6 +297,92 @@ def load_config() -> dict:
         return result
     except Exception:
         return defaults
+
+
+def _load_system_prompt(system_prompt_path: str) -> str:
+    """Load system prompt from file path."""
+    try:
+        with open(system_prompt_path, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"[rapper/system-prompt] WARNING: Failed to load system prompt from {system_prompt_path}: {e}", file=sys.stderr)
+        return ""
+
+
+def _build_reviewer_prompt(original_prompt: str, config: dict, board_task_id: str | None = None, workdir: str | None = None) -> str:
+    """Build enhanced reviewer prompt following Reviewer Prompt Protocol."""
+    agent_board = config.get("agent_board", {})
+    reviewer_config = config.get("reviewer") or {}
+
+    agent_id = agent_board.get("agent_id", "reviewer-1")
+    role = agent_board.get("role", "reviewer")
+
+    # Only apply reviewer protocol if role is actually reviewer
+    if role != "reviewer":
+        return original_prompt
+
+    verdict_start = reviewer_config.get("verdict_sentinel_start", "<<<REVIEW_VERDICT_JSON>>>")
+    verdict_end = reviewer_config.get("verdict_sentinel_end", "<<<END_REVIEW_VERDICT_JSON>>>")
+
+    reviewer_prompt = f"""You are Agent Board Reviewer {agent_id}.
+
+ROLE:
+- You verify completed implementation tasks.
+- You MUST NOT modify source code.
+- You may read files and run tests/lint/build commands.
+- Your final output MUST include REVIEW_VERDICT_JSON between sentinels.
+
+TASK CONTEXT:
+- board_task_id: {board_task_id or "unknown"}
+- workdir: {workdir or "/unknown"}
+
+REVIEW STEPS:
+1. Read task description and comments.
+2. Inspect git status, recent commits, and diff in workdir.
+3. Check AC coverage and logic correctness.
+4. Run relevant tests/lint/build if project provides them.
+5. Identify only actionable issues. Do not nitpick.
+6. Produce a concise report and verdict JSON.
+
+BLOCKING RULES:
+- Any critical finding => rejected.
+- 2 or more major findings => rejected.
+- Test/build failure caused by this change => rejected.
+- Cannot determine implementation output => rejected.
+- Parser failure or missing JSON => daemon will reject.
+
+ORIGINAL TASK:
+{original_prompt}
+
+FINAL OUTPUT REQUIRED:
+{verdict_start}
+{{
+  "status": "completed",
+  "verdict": "approved|rejected",
+  "summary": "One sentence summary of review conclusion",
+  "findings": [
+    {{
+      "severity": "critical|major|minor",
+      "category": "logic|ac-coverage|testing|quality|security",
+      "location": "file:line or description",
+      "summary": "Brief issue description",
+      "detail": "Expected vs actual behavior and fix suggestion"
+    }}
+  ],
+  "approved_acs": [],
+  "rejected_acs": [],
+  "stats": {{
+    "files_changed": 0,
+    "lines_added": 0,
+    "lines_removed": 0,
+    "tests_run": 0,
+    "tests_passed": 0,
+    "tests_failed": 0
+  }}
+}}
+{verdict_end}"""
+
+    return reviewer_prompt
 
 
 def post_board_comment(board_task_id: str, message: str, config: dict) -> bool:
@@ -1190,14 +1284,16 @@ def cancel_task(task_id: str) -> bool:
 
 class TaskRunner:
     """Runs Claude Code tasks in background."""
-    
+
     def __init__(self,
                  claude_path: str = "claude",
                  default_model: str = "claude-sonnet-4-20250514",
-                 rapper_dir: str | None = None):
+                 rapper_dir: str | None = None,
+                 config: dict | None = None):
         self.claude_path = claude_path
         self.default_model = default_model
         self.rapper_dir = rapper_dir or os.environ.get("RAPPER_DIR", "/app/rapper")
+        self.config = config  # Store config for reviewer settings injection
         self._running_tasks: dict[str, subprocess.Popen] = {}
         init_db()
     
@@ -1233,8 +1329,8 @@ class TaskRunner:
         workdir = workdir or os.getcwd()
         model = model or self.default_model
 
-        # Add structured result and progress instructions to prompt
-        enhanced_prompt = _add_structured_result_instructions(prompt, task_id)
+        # Process prompt: system prompt injection + reviewer protocol + structured result
+        final_prompt = self._process_prompt(prompt, task_id, board_task_id, workdir)
 
         # Capture Claude Code version
         claude_version = None
@@ -1253,7 +1349,7 @@ class TaskRunner:
         task = Task(
             id=task_id,
             name=name,
-            prompt=enhanced_prompt,
+            prompt=final_prompt,
             workdir=workdir,
             status="pending",
             max_budget_usd=max_budget_usd,
@@ -1264,32 +1360,20 @@ class TaskRunner:
         task.save()
 
         # Claim Board task if provided (atomically move todo→doing before execution)
-        claim_success = claim_board_task_if_provided(task)
+        claim_success = claim_board_task_if_provided(task, config=self.config)
         if not claim_success:
             # Log warning but continue - this is non-fatal for background task execution
             pass
 
-        # Build command
-        cmd = [
-            self.claude_path,
-            "-p",
-            "--model", model,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--max-turns", str(max_turns),
-            "--dangerously-skip-permissions",
-        ]
-        
-        if max_budget_usd is not None:
-            cmd.extend(["--max-budget-usd", str(max_budget_usd)])
-        
-        if fallback_model:
-            cmd.extend(["--fallback-model", fallback_model])
-        
-        if allowed_tools:
-            cmd.extend(["--allowedTools", ",".join(allowed_tools)])
-        
-        cmd.extend(["--", prompt])
+        # Build command with settings injection
+        cmd = self._build_claude_command(
+            model=model,
+            max_turns=max_turns,
+            max_budget_usd=max_budget_usd,
+            fallback_model=fallback_model,
+            allowed_tools=allowed_tools,
+            prompt=final_prompt
+        )
         
         # Environment
         env = os.environ.copy()
@@ -1351,7 +1435,138 @@ class TaskRunner:
         monitor.start()
         
         return task
-    
+
+    def _process_prompt(self, prompt: str, task_id: str, board_task_id: str | None = None, workdir: str | None = None) -> str:
+        """Process the prompt: system prompt injection + reviewer protocol + structured result."""
+        final_prompt = prompt
+        is_reviewer = False
+
+        # Apply system prompt injection if configured
+        if self.config:
+            # Handle both dict and dataclass config objects
+            if hasattr(self.config, 'claude'):
+                claude_config = self.config.claude
+            else:
+                claude_config = self.config.get('claude', {})
+
+            # Get system prompt path
+            system_prompt_path = None
+            if hasattr(claude_config, 'get'):
+                system_prompt_path = claude_config.get('append_system_prompt_path')
+            else:
+                system_prompt_path = getattr(claude_config, 'append_system_prompt_path', None)
+
+            if system_prompt_path:
+                system_prompt = _load_system_prompt(system_prompt_path)
+                if system_prompt:
+                    final_prompt = f"{system_prompt}\n\n{final_prompt}"
+
+            # Apply reviewer prompt protocol if role is reviewer
+            if hasattr(self.config, 'agent_board'):
+                agent_board = self.config.agent_board
+            else:
+                agent_board = self.config.get('agent_board', {})
+
+            role = None
+            if hasattr(agent_board, 'get'):
+                role = agent_board.get('role')
+            else:
+                role = getattr(agent_board, 'role', None)
+
+            if role == 'reviewer':
+                is_reviewer = True
+                final_prompt = _build_reviewer_prompt(final_prompt, self._config_to_dict(), board_task_id, workdir)
+
+        # Add structured result and progress instructions ONLY for non-reviewer roles
+        # Reviewer role already includes its own output format requirements via sentinel verdict blocks
+        if not is_reviewer:
+            final_prompt = _add_structured_result_instructions(final_prompt, task_id)
+
+        return final_prompt
+
+    def _build_claude_command(self, model: str, max_turns: int, max_budget_usd: float | None = None,
+                              fallback_model: str | None = None, allowed_tools: list[str] | None = None,
+                              prompt: str = "") -> list[str]:
+        """Build Claude command with settings injection support."""
+        cmd = [
+            self.claude_path,
+            "-p",
+            "--model", model,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--max-turns", str(max_turns),
+            "--dangerously-skip-permissions",
+        ]
+
+        # Inject settings if configured
+        if self.config:
+            # Handle both dict and dataclass config objects
+            if hasattr(self.config, 'claude'):
+                claude_config = self.config.claude
+            else:
+                claude_config = self.config.get('claude', {})
+
+            # Get settings path
+            settings_path = None
+            if hasattr(claude_config, 'get'):
+                settings_path = claude_config.get('settings_path')
+            else:
+                settings_path = getattr(claude_config, 'settings_path', None)
+
+            if settings_path and settings_path.strip():
+                # Check if settings file exists (warn but continue if not)
+                if os.path.exists(settings_path):
+                    cmd.extend(["--settings", settings_path])
+                else:
+                    print(f"[rapper/settings] WARNING: settings file not found at {settings_path}, continuing without settings", file=sys.stderr)
+
+        if max_budget_usd is not None:
+            cmd.extend(["--max-budget-usd", str(max_budget_usd)])
+
+        if fallback_model:
+            cmd.extend(["--fallback-model", fallback_model])
+
+        if allowed_tools:
+            cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+
+        cmd.extend(["--", prompt])
+
+        return cmd
+
+    def _config_to_dict(self) -> dict:
+        """Convert config object to dict for compatibility with existing functions."""
+        if not self.config:
+            return {}
+
+        if hasattr(self.config, 'get'):
+            # Already a dict
+            return self.config
+
+        # Convert dataclass to dict
+        result = {}
+        if hasattr(self.config, 'agent_board'):
+            if hasattr(self.config.agent_board, '__dict__'):
+                result['agent_board'] = self.config.agent_board.__dict__
+            else:
+                result['agent_board'] = self.config.agent_board
+
+        if hasattr(self.config, 'claude'):
+            if hasattr(self.config.claude, '__dict__'):
+                result['claude'] = self.config.claude.__dict__
+            else:
+                result['claude'] = self.config.claude
+
+        if hasattr(self.config, 'reviewer'):
+            if self.config.reviewer is not None:
+                if hasattr(self.config.reviewer, '__dict__'):
+                    result['reviewer'] = self.config.reviewer.__dict__
+                else:
+                    result['reviewer'] = self.config.reviewer
+            else:
+                result['reviewer'] = None
+
+        return result
+
     def _monitor_task(self,
                       task: Task,
                       proc: subprocess.Popen,
@@ -1545,34 +1760,54 @@ class TaskRunner:
                 except Exception:
                     pass
     
-    def _run_task_sync(self, task: Task, timeout: int = 3600, max_turns: int = 200):
-        """Run a task synchronously (for daemon process)."""
-        # Claim Board task if provided (atomically move todo→doing before execution)
-        claim_success = claim_board_task_if_provided(task)
-        if not claim_success:
-            # Log warning but continue - this is non-fatal for task execution
-            pass
+    def _run_task_sync(self, task: Task, timeout: int = 3600, max_turns: int = 200, skip_claim: bool = None):
+        """Run a task synchronously (for daemon process).
+
+        Args:
+            skip_claim: If True, skip board task claiming. If None, auto-detect daemon context.
+        """
+        # Detect daemon context to avoid duplicate claiming
+        should_skip_claim = skip_claim
+        if should_skip_claim is None:
+            # Auto-detect: skip claim if we're in daemon context
+            env_daemon = os.environ.get('RAPPER_DAEMON_CONTEXT') == '1'
+            config_daemon = False
+
+            if self.config:
+                # Handle both dict and dataclass config objects
+                if hasattr(self.config, 'agent_board'):
+                    agent_board = self.config.agent_board
+                else:
+                    agent_board = self.config.get('agent_board', {})
+
+                role = None
+                if hasattr(agent_board, 'get'):
+                    role = agent_board.get('role')
+                else:
+                    role = getattr(agent_board, 'role', None)
+
+                config_daemon = role in ['reviewer', 'daemon']
+
+            should_skip_claim = env_daemon or config_daemon
+
+        if not should_skip_claim:
+            # Claim Board task if provided (atomically move todo→doing before execution)
+            claim_success = claim_board_task_if_provided(task, config=self.config)
+            if not claim_success:
+                # Log warning but continue - this is non-fatal for task execution
+                pass
 
         model = self.default_model
-        
-        # Build command
-        cmd = [
-            self.claude_path,
-            "-p",
-            "--model", model,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--max-turns", str(max_turns),
-            "--dangerously-skip-permissions",
-        ]
 
-        if task.max_budget_usd is not None:
-            cmd.extend(["--max-budget-usd", str(task.max_budget_usd)])
-
-        if task.fallback_model:
-            cmd.extend(["--fallback-model", task.fallback_model])
-
-        cmd.extend(["--", task.prompt])
+        # Build command with settings injection (reuse shared logic)
+        cmd = self._build_claude_command(
+            model=model,
+            max_turns=max_turns,
+            max_budget_usd=task.max_budget_usd,
+            fallback_model=task.fallback_model,
+            allowed_tools=None,
+            prompt=task.prompt
+        )
         
         # Environment
         env = os.environ.copy()
@@ -2048,7 +2283,7 @@ def main():
         task.save()
 
         # Claim Board task if provided (atomically move todo→doing before execution)
-        claim_success = claim_board_task_if_provided(task)
+        claim_success = claim_board_task_if_provided(task, config=None)  # CLI mode uses default config
         if not claim_success:
             print(f"[rapper] Warning: Failed to claim board task {task.board_task_id}, proceeding anyway", file=sys.stderr)
 
