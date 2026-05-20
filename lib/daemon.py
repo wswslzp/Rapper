@@ -153,23 +153,29 @@ class AgentBoardClient:
         except (HTTPError, URLError, json.JSONDecodeError):
             return []
 
-    def claim_task(self, task_id: str, agent_id: str, retries: int = 3) -> bool:
-        """Atomically claim a task by moving it to 'doing' column and setting assignee.
+    def claim_task(self, task_id: str, agent_id: str, retries: int = 3, target_column: Optional[str] = None) -> bool:
+        """Atomically claim a task by moving it to target column and setting assignee.
 
         This is the core of Method A: claim BEFORE execution so the task
-        is no longer visible in todo on the next poll, even if execution
+        is no longer visible in original poll column on the next poll, even if execution
         crashes or the daemon restarts.
 
         Args:
             task_id: Board task ID to claim.
             agent_id: Agent ID to assign the task to.
             retries: Number of retry attempts on transient errors.
+            target_column: Target column to move task to. Defaults to 'doing' for
+                          backward compatibility with rapper agents claiming todo tasks.
+                          Reviewers should pass 'review' to preserve column.
 
         Returns:
-            True if task was successfully moved to 'doing', False otherwise.
+            True if task was successfully claimed to target column, False otherwise.
         """
+        # Default to 'doing' for backward compatibility (rapper claiming todo tasks)
+        column = target_column if target_column is not None else 'doing'
+
         payload = {
-            'column': 'doing',
+            'column': column,
             'assignee': agent_id,
             'lastHeartbeat': datetime.utcnow().isoformat() + 'Z',
         }
@@ -701,13 +707,18 @@ class RapperDaemon:
             self.logger.info(f"Picked task: {task_id} (current load: {total_running}/{max_concurrent})")
 
             # ── Method A: Claim task on the board BEFORE execution ────────────────
-            # Move todo → doing immediately so the next poll never sees it again,
+            # Move task to appropriate column immediately so next poll doesn't see it again,
             # even if this daemon restarts or execution crashes before reporting done.
             self._save_picked_task(task_id)  # Solution B: file-based dedup (same-process guard)
 
-            claimed = self.client.claim_task(task_id, self.agent_id)
+            # Determine target column based on agent role and current task state
+            target_column = 'doing'  # Default for rapper claiming todo tasks
+            if self.role == 'reviewer' and board_task.get('column') == 'review':
+                target_column = 'review'  # Reviewer claiming review task should preserve review column
+
+            claimed = self.client.claim_task(task_id, self.agent_id, target_column=target_column)
             if claimed:
-                self.logger.info(f"Claimed task {task_id} → doing (pre-execution)")
+                self.logger.info(f"Claimed task {task_id} → {target_column} (pre-execution)")
 
                 # If this is a reviewer claiming a review task, set review metadata
                 if self.role == 'reviewer' and board_task.get('column') == 'review':

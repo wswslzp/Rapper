@@ -113,7 +113,7 @@ class TestDaemonRequeueStalePicked(unittest.TestCase):
                 # 追踪 daemon 选择的任务
                 claimed_tasks = []
 
-                def mock_claim_task(task_id, agent_id, retries=3):
+                def mock_claim_task(task_id, agent_id, retries=3, target_column=None):
                     claimed_tasks.append(task_id)
                     return True
 

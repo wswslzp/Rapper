@@ -301,7 +301,7 @@ class TestDaemonPollColumns(unittest.TestCase):
             self.assertIn('review', queried_columns)
             self.assertNotIn('todo', queried_columns)
             self.assertNotIn('ready', queried_columns)
-            daemon.client.claim_task.assert_called_once_with('review_task_123', 'test-agent')
+            daemon.client.claim_task.assert_called_once_with('review_task_123', 'test-agent', target_column='review')
             daemon.task_executor.submit.assert_called_once_with(
                 daemon._execute_task_in_background,
                 'review_task_123',

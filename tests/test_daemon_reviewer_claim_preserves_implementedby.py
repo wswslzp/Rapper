@@ -132,8 +132,8 @@ class TestReviewerClaimPreservesImplementedBy(unittest.TestCase):
         # 验证：reviewer 从 'review' 列拉取任务
         daemon.client.get_tasks.assert_called_with(None, 'review')
 
-        # 验证：reviewer claim 了正确的任务
-        daemon.client.claim_task.assert_called_once_with('task_7f25a48f', 'reviewer-1')
+        # 验证：reviewer claim 了正确的任务，并保持在 review 列
+        daemon.client.claim_task.assert_called_once_with('task_7f25a48f', 'reviewer-1', target_column='review')
 
         # 验证：claim 后更新了 review metadata，但保留了 implementedBy
         daemon.client.update_task_metadata.assert_called()
